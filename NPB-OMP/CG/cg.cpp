@@ -682,7 +682,7 @@ static void conj_grad(struct resources *res, int colidx[],
 		for(j = 0; j < lastrow - firstrow + 1; j++){
 			suml = 0.0;
 			int tid = omp_get_thread_num();
-			int i = 0;
+			int x = 0;
 			int n = 0;
 			struct timespec req, rem;
 			req.tv_sec = 0;       
@@ -735,11 +735,11 @@ static void conj_grad(struct resources *res, int colidx[],
 				// 	fprintf(stderr, "poll completion failed\n");
 				// } 
 				//suml += /*a[k]*/ res->buf[/*tid*/ /* block_size +*/ tid * block_size + i] * p[colidx[k]];
-				suml += res->buf[tid * block_size  + i] * p[colidx[k]];
+				suml += res->buf[tid * block_size  + x] * p[colidx[k]];
 				//printf("a[k] is: %f\n",res->buf[tid * block_size  + i]);
 				//printf("Thread %d: a[%d] = %f\n", omp_get_thread_num(), i, res->buf[tid * block_size  + i]);
 				//fprintf(fp, "Thread %d: a[%d] = %f\n", omp_get_thread_num(), i, res->buf[tid * block_size  + i]);
-				i++;
+				x++;
 				//fclose(fp);
 				//printf("suml is: %f\n", suml);
 			}
