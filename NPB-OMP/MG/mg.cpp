@@ -56,25 +56,30 @@ Authors of the OpenMP code:
 	Júnior Löff <loffjh@gmail.com>
 	
 */
-
+#include <infiniband/verbs.h>
+#include "omp.h"
+#include "../common/npb-CPP.hpp"
+#include "npbparams.hpp"
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <unordered_map>
 #include <endian.h>
 #include <byteswap.h>
 #include <getopt.h>
-// 或者
+#include <algorithm>
 #include <malloc.h>
 #include <atomic>
 #include <sys/time.h>
 #include <arpa/inet.h>
-#include <infiniband/verbs.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <math.h>
-#define MAX_POLL_CQ_TIMEOUT 2000
+#define MAX_POLL_CQ_TIMEOUT 200000
+
+using std::min;
 
 /* structure of test parameters */
 struct config_t
@@ -117,7 +122,7 @@ ops */
 };
 struct config_t config = {
 	"mlx5_2",  /* dev_name */
-	"10.140.81.195",  /* server_name */
+	"10.140.82.141",  /* server_name */
 	19870, /* tcp_port */
 	1,	 /* ib_port */
 	0 /* gid_idx */};
@@ -128,6 +133,7 @@ static int resources_create(struct resources *res);
 static int sock_connect(const char *servername, int port);
 int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data);
 static int poll_completion(struct resources *res);
+static int poll_completion_2(struct resources *res);
 static int modify_qp_to_init(struct ibv_qp *qp);
 static int modify_qp_to_rtr(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t dlid, uint8_t *dgid);
 static int modify_qp_to_rts(struct ibv_qp *qp);
@@ -139,8 +145,10 @@ int myread(struct resources *res, uint64_t remote_mem_addr, double* local_buf, s
 
 
 const size_t block_num = 1000;
-const size_t block_size = 100;
-const size_t cpupool_mem_size = 307400 / 5;
+const size_t num_threads = 1;
+const size_t cpupool_mem_size = 4800 * 1024 / 100 * 100;
+const size_t block_size =  cpupool_mem_size / num_threads;
+
 const size_t mempool_mem_size = 1024ULL * 1024  * 1024 * 10;
            
 
@@ -154,9 +162,6 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
 #endif
 
-#include "omp.h"
-#include "../common/npb-CPP.hpp"
-#include "npbparams.hpp"
 
 #define NM (2+(1<<LM)) /* actual dimension including ghost cells for communications */
 #define NV (ONE*(2+(1<<NDIM1))*(2+(1<<NDIM2))*(2+(1<<NDIM3))) /* size of rhs array */
@@ -178,6 +183,20 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #define T_COMM3 9
 #define T_LAST 10
 
+
+
+#if defined(USE_POW)
+#define r23 pow(0.5, 23.0)
+#define r46 (r23*r23)
+#define t23 pow(2.0, 23.0)
+#define t46 (t23*t23)
+#else
+#define r23 (0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5*0.5)
+#define r46 (r23*r23)
+#define t23 (2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0*2.0)
+#define t46 (t23*t23)
+#endif
+
 /* global variables */
 #if defined(DO_NOT_ALLOCATE_ARRAYS_WITH_DYNAMIC_MEMORY_AND_AS_SINGLE_DIMENSION)
 static int nx[MAXLEVEL+1];
@@ -188,9 +207,9 @@ static int m2[MAXLEVEL+1];
 static int m3[MAXLEVEL+1];
 static int ir[MAXLEVEL+1];
 static int debug_vec[8];
-static double u[NR];
-static double v[NV];
-static double r[NR];
+// static double u[NR];
+// static double v[NV];
+// static double r[NR];
 #else
 static int (*nx)=(int*)malloc(sizeof(int)*(MAXLEVEL+1));
 static int (*ny)=(int*)malloc(sizeof(int)*(MAXLEVEL+1));
@@ -201,29 +220,36 @@ static int (*m3)=(int*)malloc(sizeof(int)*(MAXLEVEL+1));
 static int (*ir)=(int*)malloc(sizeof(int)*(MAXLEVEL+1));
 static int (*debug_vec)=(int*)malloc(sizeof(int)*(8));
 
+uint64_t u = 0;
+uint64_t v = 0;
+uint64_t r = 0;
+//add a metadata .which range in the local, offset + length. check data on the remote or local.
+
 //put them on the remote.
-static double (*u)=(double*)malloc(sizeof(double)*(NR));
-static double (*v)=(double*)malloc(sizeof(double)*(NV));
-static double (*r)=(double*)malloc(sizeof(double)*(NR));
+// static double (*u)=(double*)malloc(sizeof(double)*(NR));
+// static double (*v)=(double*)malloc(sizeof(double)*(NV));
+// static double (*r)=(double*)malloc(sizeof(double)*(NR));
 #endif
 static int is1, is2, is3, ie1, ie2, ie3, lt, lb;
 static boolean timeron;
 
 /* function prototypes */
 static void bubble(double ten[][MM], int j1[][MM], int j2[][MM], int j3[][MM], int m, int ind);
-static void comm3(void* pointer_u, int n1, int n2, int n3, int kk);
-static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, int n1, int n2, int n3, int k);
-static void mg3P(double u[], double v[], double r[], double a[4], double c[4], int n1, int n2, int n3, int k);
-static void norm2u3(void* pointer_r, int n1, int n2, int n3, double* rnm2, double* rnmu, int nx, int ny, int nz);
+static void comm3(struct resources *res, uint64_t u, int n1, int n2, int n3, int kk);
+static void interp(struct resources *res, uint64_t z, int mm1, int mm2, int mm3, uint64_t u, int n1, int n2, int n3, int k);
+static void mg3P(struct resources *res, uint64_t u, uint64_t v, uint64_t r, double a[4], double c[4], int n1, int n2, int n3, int k);
+static void norm2u3(struct resources *res, uint64_t r, int n1, int n2, int n3, double* rnm2, double* rnmu, int nx, int ny, int nz);
 static double power(double a, int n);
-static void psinv(void* pointer_r, void* pointer_u, int n1, int n2, int n3, double c[4], int k);
-static void rep_nrm(void* pointer_u, int n1, int n2, int n3, char* title, int kk);
-static void resid(void* pointer_u, void* pointer_v, void* pointer_r, int n1, int n2, int n3, double a[4], int k);
-static void rprj3(void* pointer_r, int m1k, int m2k, int m3k, void* pointer_s, int m1j, int m2j, int m3j, int k);
+static void psinv(struct resources *res, uint64_t r, uint64_t u, int n1, int n2, int n3, double c[4], int k);
+static void rep_nrm(struct resources *res, uint64_t u, int n1, int n2, int n3, char* title, int kk);
+static void resid(struct resources *res, uint64_t u, uint64_t v, uint64_t r, int n1, int n2, int n3, double a[4], int k);
+static void rprj3(struct resources *res, uint64_t r, int m1k, int m2k, int m3k, uint64_t s, int m1j, int m2j, int m3j, int k);
 static void setup(int* n1, int* n2, int* n3, int k);
-static void showall(void* pointer_z, int n1, int n2, int n3);
-static void zero3(void* pointer_z, int n1, int n2, int n3);
-static void zran3(void* pointer_z, int n1, int n2, int n3, int nx, int ny, int k);
+static void showall(struct resources *res, uint64_t z, int n1, int n2, int n3);
+static void zero3(struct resources *res, uint64_t z, int n1, int n2, int n3);
+static void zran3(struct resources *res, uint64_t z, int n1, int n2, int n3, int nx, int ny, int k);  
+void vranlc(struct resources *res, int n, double *x_seed, double a, uint64_t y);
+double randlc(double *x, double a);
 
 /* mg */
 int main(int argc, char *argv[]){
@@ -236,6 +262,123 @@ int main(int argc, char *argv[]){
 	 * and is not global. it is the current iteration
 	 * -------------------------------------------------------------------------
 	 */
+	struct resources res;
+	int rc = 1;
+	char temp_char;
+	resources_init(&res);
+	if (resources_create(&res)) {
+		fprintf(stderr, "failed to create resources\n");
+	}
+
+	if (connect_qp(&res)) {
+		fprintf(stderr, "failed to connect QPs\n");
+	}
+
+	if (sock_sync_data(res.sock, 1, "W", &temp_char)) /* just send a dummy char back and forth */
+	{
+		fprintf(stderr, "sync error after RDMA ops\n");
+		rc = 1;
+	}
+
+	uint64_t addr = 0;
+	//put variable u on the remote
+	u_int64_t slices_cnt = ceil(sizeof(double) * NR / cpupool_mem_size) + 1;
+	printf("slices is %d\n", slices_cnt);
+	if (sizeof(double) * NR <= cpupool_mem_size ) {
+		u = mymalloc(&res, sizeof(double) * NR, 0);
+		if (poll_completion(&res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+	} else {
+		for (int i = 0; i < slices_cnt; i++) {
+			if (i == slices_cnt - 1) {
+				addr = mymalloc(&res, sizeof(double) * NR - (slices_cnt - 1) * cpupool_mem_size, i * cpupool_mem_size);
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				printf("memory limit is: %ld\n", addr + sizeof(double) * NR - (slices_cnt - 1) * cpupool_mem_size);
+			} else {
+				addr = mymalloc(&res, cpupool_mem_size, i * cpupool_mem_size); 
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				if (i == 0) {
+					u = addr;
+				}
+			}
+		}
+	}
+	printf("u: %ld u + NR %ld\n", u, u + NR * sizeof(double));
+
+	// std::unordered_map<std::string, uint64_t> mymap;
+	// mymap["u"] = u;
+	// mymap["r"] = u + sizeof(double) * (NR);
+	// mymap["v"] = u + sizeof(double) * (2 * NR);
+	
+
+	//put r on the remote
+	addr = 0;
+	slices_cnt = ceil(sizeof(double) * NR / cpupool_mem_size) + 1;
+	printf("slices is %d\n", slices_cnt);
+	if (sizeof(double) * NR <= cpupool_mem_size ) {
+		r = mymalloc(&res, sizeof(double) * NR, sizeof(double) * (NR + 1000));
+		if (poll_completion(&res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+	} else {
+		for (int i = 0; i < slices_cnt; i++) {
+			if (i == slices_cnt - 1) {
+				addr = mymalloc(&res, sizeof(double) * NR - (slices_cnt - 1) * cpupool_mem_size, sizeof(double) * (NR + 1000) + i * cpupool_mem_size);
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				printf("memory limit is: %ld\n", addr + sizeof(double) * NR - (slices_cnt - 1) * cpupool_mem_size);
+			} else {
+				addr = mymalloc(&res, cpupool_mem_size, sizeof(double) * (NR + 1000) + i * cpupool_mem_size); 
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				if (i == 0) {
+					r = addr;
+				}
+			}
+		}
+	}
+	printf("r: %ld r + NR %ld\n", r, r + NR * sizeof(double));
+	//exit(0);
+
+	addr = 0;
+	//put variable v on the remote
+	slices_cnt = ceil(sizeof(double) * NV / cpupool_mem_size) + 1;
+	printf("slices is %d\n", slices_cnt);
+	if (sizeof(double) * NV <= cpupool_mem_size ) {
+		v = mymalloc(&res, sizeof(double) * NV, sizeof(double) * (2 * (NR + 1000)));
+		if (poll_completion(&res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+	} else {
+		for (int i = 0; i < slices_cnt; i++) {
+			if (i == slices_cnt - 1) {
+				addr = mymalloc(&res, sizeof(double) * NV - (slices_cnt - 1) * cpupool_mem_size, sizeof(double) * (2 * (NR + 1000)) + i * cpupool_mem_size);
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				printf("memory limit is: %ld\n", addr + sizeof(double) * NV - (slices_cnt - 1) * cpupool_mem_size);
+			} else {
+				addr = mymalloc(&res, cpupool_mem_size, sizeof(double) * (2 * (NR + 1000)) + i * cpupool_mem_size); 
+				if (poll_completion(&res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				if (i == 0) {
+					v = addr;
+				}
+			}
+		}
+	}
+	printf("v: %ld v + NV %ld\n", v, v + NV * sizeof(double));
+
+	
+
 	int k, it;
 	double t, tinit, mflops;
 
@@ -246,6 +389,9 @@ int main(int argc, char *argv[]){
 	double nn, verify_value, err;
 	boolean verified;
 	char class_npb;
+
+	
+
 
 	int i;
 	char* t_names[T_LAST];
@@ -313,6 +459,7 @@ int main(int argc, char *argv[]){
 		for(i = 0; i <= 7; i++){
 			debug_vec[i] = DEBUG_DEFAULT;
 		}
+		//debug_vec[2] = 2;
 	}
 
 	if((nx[lt] != ny[lt]) || (nx[lt] != nz[lt])){
@@ -373,38 +520,73 @@ int main(int argc, char *argv[]){
 	k = lt;
 
 	setup(&n1,&n2,&n3,k);
-
-	zero3(u,n1,n2,n3);
-
-	zran3(v,n1,n2,n3,nx[lt],ny[lt],k);
 	
-	norm2u3(v,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
+	zero3(&res, u,n1,n2,n3);
+	
+	// int cnt = ceil(NR * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(&res, u + i * cpupool_mem_size, res.buf, NR * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(&res, u + i * cpupool_mem_size, res.buf, cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int i = 0; i < min(NR * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); i++) {
+	// 		printf("%f \n", res.buf[i]);
+	// 	}
+	// }
+	// exit(0); 
+
+	zran3(&res, v, n1,n2,n3,nx[lt],ny[lt],k);	
+	
+
+	
+	norm2u3(&res, v,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
+	// int cnt = ceil(NV * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(&res, v + i * cpupool_mem_size, res.buf, NV * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(&res, v + i * cpupool_mem_size, res.buf, cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int i = 0; i < min(NV * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); i++) {
+	// 		printf("%f \n", res.buf[i]);
+	// 	}
+	// }
+	// exit(0); 
+	// printf("rnm2 = %f, rnmu = %f", rnm2, rnmu);
+	// exit(0);
+	
 
 	printf("\n\n NAS Parallel Benchmarks 4.1 Parallel C++ version with OpenMP - MG Benchmark\n\n");
 	printf(" Size: %3dx%3dx%3d (class_npb %1c)\n", nx[lt], ny[lt], nz[lt], class_npb);
 	printf(" Iterations: %3d\n", nit);
 	
+
 	#pragma omp parallel
 	{
-		resid(u,v,r,n1,n2,n3,a,k);
-
-		norm2u3(r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
-
-		/*
-		 * ---------------------------------------------------------------------
-		 * one iteration for startup
-		 * ---------------------------------------------------------------------
-		 */
-		mg3P(u,v,r,a,c,n1,n2,n3,k);
-		resid(u,v,r,n1,n2,n3,a,k);
+		resid(&res,u,v,r,n1,n2,n3,a,k);
+		norm2u3(&res, r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);	
+		mg3P(&res, u,v,r,a,c,n1,n2,n3,k);
+		resid(&res, u,v,r,n1,n2,n3,a,k);
 	}
 	
 	setup(&n1,&n2,&n3,k);
 
-	zero3(u,n1,n2,n3);
+	zero3(&res, u,n1,n2,n3);
 
-	zran3(v,n1,n2,n3,nx[lt],ny[lt],k);
-
+	zran3(&res, v,n1,n2,n3,nx[lt],ny[lt],k);
 	timer_stop(T_INIT);
 	tinit = timer_read(T_INIT);
 	printf(" Initialization time: %15.3f seconds\n", tinit);
@@ -422,15 +604,13 @@ int main(int argc, char *argv[]){
 				timer_start(T_RESID2);
 		}
 		
-		resid(u,v,r,n1,n2,n3,a,k);
-		
+		resid(&res, u,v,r,n1,n2,n3,a,k);
 		if(timeron){
 			#pragma omp master
 				timer_stop(T_RESID2);
 		}
 
-		norm2u3(r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
-
+		norm2u3(&res, r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
 		for(it = 1; it <= nit; it++){
 			if((it==1)||(it==nit)||((it%5)==0)){
 				#pragma omp master
@@ -441,9 +621,7 @@ int main(int argc, char *argv[]){
 				#pragma omp master
 					timer_start(T_MG3P);
 			}
-
-			mg3P(u,v,r,a,c,n1,n2,n3,k);
-
+			mg3P(&res, u,v,r,a,c,n1,n2,n3,k);
 			if(timeron){
 				#pragma omp master
 					timer_stop(T_MG3P);
@@ -453,19 +631,91 @@ int main(int argc, char *argv[]){
 					timer_start(T_RESID2);
 			}
 
-			resid(u,v,r,n1,n2,n3,a,k);
-
+			resid(&res, u,v,r,n1,n2,n3,a,k);
+	
 			if(timeron){
 				#pragma omp master
 					timer_stop(T_RESID2);
 			}
 		}
 	
-		norm2u3(r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
+		norm2u3(&res,r,n1,n2,n3,&rnm2,&rnmu,nx[lt],ny[lt],nz[lt]);
+		
 	} /* end parallel */
 
 	timer_stop(T_BENCH);
+	// FILE *file_v, *file_r, *file_u;
+    // file_v = fopen("v.txt", "w"); 
+	// file_r = fopen("r.txt", "w");
+	// file_u = fopen("u.txt", "w");
 
+    // if (file_v == NULL) {
+    //     perror("Error opening file");
+    // }
+	// if (file_u == NULL) {
+    //     perror("Error opening file");
+    // }
+	// if (file_r == NULL) {
+    //     perror("Error opening file");
+    // }
+	
+	// int cnt = ceil(NR * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(&res, u + i * cpupool_mem_size, res.buf, NR * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(&res, u + i * cpupool_mem_size, res.buf, cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NR * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_u, "%f \n", res.buf[j]);
+	// 	}
+	// }
+	
+	
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(&res, r + i * cpupool_mem_size, res.buf, NR * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(&res, r + i * cpupool_mem_size, res.buf, cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NR * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_r, "%f \n", res.buf[j]);
+	// 	}
+	// }
+
+	// cnt = ceil(NV * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(&res, v + i * cpupool_mem_size, res.buf, NV * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(&res, v + i * cpupool_mem_size, res.buf, cpupool_mem_size);
+	// 		if (poll_completion(&res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NV * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_v, "%f \n", res.buf[j]);
+	// 	}
+	// }
+	// fclose(file_u);
+	// fclose(file_v);
+	// fclose(file_r);
+	// exit(0);
 	t = timer_read(T_BENCH);    	
 
 	verified = FALSE;
@@ -625,46 +875,147 @@ static void bubble(double ten[][MM], int j1[][MM], int j2[][MM], int j3[][MM], i
  * comm3 organizes the communication on all borders 
  * ---------------------------------------------------------------------
  */
-static void comm3(void* pointer_u, int n1, int n2, int n3, int kk){
-#ifdef __clang__
-		using custom_cast = double (*)[n2][n1];
-		custom_cast u = reinterpret_cast<custom_cast>(pointer_u);
-#else
-		double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
-#endif
-
+static void comm3(struct resources *res, uint64_t u, int n1, int n2, int n3, int kk){
+// #ifdef __clang__
+// 		using custom_cast = double (*)[n2][n1];
+// 		custom_cast u = reinterpret_cast<custom_cast>(pointer_u);
+// #else
+// 		double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
+// #endif
+	// struct timespec req, rem;
+	// req.tv_sec = 0;       
+    // req.tv_nsec = 100; 
 	int i1, i2, i3;
 	if(timeron){
 		#pragma omp master
 			timer_start(T_COMM3);
 	}
 	#pragma omp for
-	for(i3 = 1; i3 < n3-1; i3++){
 		/* axis = 1 */
-		for(i2 = 1; i2 < n2-1; i2++){
-			u[i3][i2][0] = u[i3][i2][n1-2];
-			u[i3][i2][n1-1] = u[i3][i2][1];			
-		}
+	for(i3 = 1; i3 < n3-1; i3++){
+		//int tid = omp_get_thread_num();
+		//int num_element = min(n2 * n1, static_cast<int>(block_size / sizeof(double)));	
+		//for (int i = 0; i < ceil(n2 * n1 / num_element) + 1; i++) {
+			myread(res, u + (i3 * n2 * n1) * sizeof(double), res->buf, sizeof(double) * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
+			}
+
+			for(i2 = 1; i2 < n2 - 1; i2++){
+				mywrite(res, u + (i3 * n2 * n1 + i2 * n1) * sizeof(double), res->buf + i2 * n1 + n1 - 2, sizeof(double));
+				if (poll_completion(res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+	
+				mywrite(res, u + (i3 * n2 * n1 + i2 * n1 + n1 - 1) * sizeof(double), res->buf + i2 * n1 + 1, sizeof(double));
+				if (poll_completion(res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+			//******************************
+			//u[i3][i2][0] = u[i3][i2][n1-2];
+			//u[i3][i2][n1-1] = u[i3][i2][1];			
+			}
+		//}
 		/* axis = 2 */
-		for(i1 = 0; i1 < n1; i1++){
-			u[i3][0][i1] = u[i3][n2-2][i1];
-			u[i3][n2-1][i1] = u[i3][1][i1];			
-		}
+		//for (int i = 0; i < ceil(n2 * n1 / num_element) + 1; i++) {
+			// myread(res, u + (i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * n2 * n1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+
+			for (int i1 = 0; i1 < n1; i1++) {
+				mywrite(res, u + (i3 * n2 * n1 + i1) * sizeof(double), res->buf + (n2 - 2) * n1 + i1, sizeof(double));
+				if (poll_completion(res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+	
+				mywrite(res, u + (i3 * n2 * n1 + (n2 - 1) * n1 + i1) * sizeof(double), res->buf + 1 * n1 + i1, sizeof(double));
+				if (poll_completion(res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+			}
+			
+			// u[i3][0][i1] = u[i3][n2-2][i1];
+			// u[i3][n2-1][i1] = u[i3][1][i1];			
+		//}
 	}
+
+	
+
+
+	//int num_element = min(n2 * n1, static_cast<int>(block_size / sizeof(double)));
 	/* axis = 3 */
-	#pragma omp for
-	for(i2 = 0; i2 < n2; i2++){
-		for(i1 = 0; i1 < n1; i1++){
-			u[0][i2][i1] = u[n3-2][i2][i1];
-			u[n3-1][i2][i1] = u[1][i2][i1];			
+
+ 	//u[0][i2][i1] = u[n3-2][i2][i1];
+	// 	//u[n3-1][i2][i1] = u[1][i2][i1];	
+	//#pragma omp for
+	//for (int i = 0; i < 1 ; i++) {
+		//int tid = omp_get_thread_num();
+		myread(res, u + (n3 - 2) * n2 * n1 * sizeof(double), res->buf, sizeof(double) * n2 * n1);
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
 		}
-	}
+
+		myread(res, u + (1 * n2 * n1 ) * sizeof(double), res->buf + n2 * n1, sizeof(double) * n2 * n1);
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+
+		mywrite(res, u, res->buf, sizeof(double) * n2 * n1);
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+		
+		mywrite(res, u + ((n3 - 1) * n2 * n1) * sizeof(double) , res->buf + n2 * n1, sizeof(double) * n2 * n1);
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+	//}
+	// #pragma omp for
+	// for(i2 = 0; i2 < n2; i2++){
+	// 	for(i1 = 0; i1 < n1; i1++){
+	// 		myread(res, u + ((n3 - 2) * n2 * n1 + i2 * n1 + i1) * sizeof(double), res->buf, sizeof(double));
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 		mywrite(res, u + (i2 * n1 + i1) * sizeof(double), res->buf, sizeof(double));
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 		myread(res, u + (n2 * n1 + i2 * n1 + i1) * sizeof(double), res->buf, sizeof(double));
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 		mywrite(res, u + ((n3 - 1) * n2 * n1 + i2 * n1 + i1) * sizeof(double), res->buf, sizeof(double));
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+			
+	// 	}
+	// }
+		// myread(res, u + (n2 * n1) * sizeof(double), res->buf + block_size / sizeof(double), sizeof(double) * n2 * n1);
+		// if (poll_completion(res)) {
+		// 	fprintf(stderr, "poll completion failed\n");
+		// }	
+		// mywrite(res, u + ((n3 - 1) * n2 * n1) * sizeof(double), res->buf + block_size / sizeof(double), sizeof(double) * n2 * n1);
+		// if (poll_completion(res)) {
+		// 	fprintf(stderr, "poll completion failed\n");
+		// }
+		
+	
+	// for(i2 = 0; i2 < n2; i2++){
+	// 	for(i1 = 0; i1 < n1; i1++){
+	// 	//u[0][i2][i1] = u[n3-2][i2][i1];
+	// 	//u[n3-1][i2][i1] = u[1][i2][i1];			
+	// 	}
+	// }
 
 	if(timeron){
 		#pragma omp master
 			timer_stop(T_COMM3);
 	}
 }
+
 
 /*
  * --------------------------------------------------------------------
@@ -678,16 +1029,17 @@ static void comm3(void* pointer_u, int n1, int n2, int n3, int kk){
  * performance however, with 8 separate "do i1" loops, rather than 4.
  * --------------------------------------------------------------------
  */
-static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, int n1, int n2, int n3, int k){
-#ifdef __clang__
-	using custom_cast = double (*)[mm2][mm1];
-	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
-	using custom_cast2 = double (*)[n2][n1];
-	custom_cast2 u = reinterpret_cast<custom_cast2>(pointer_u);
-#else
-	double (*z)[mm2][mm1] = (double (*)[mm2][mm1])pointer_z;
-	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
-#endif
+static void 
+interp(struct resources *res, uint64_t z, int mm1, int mm2, int mm3, uint64_t u, int n1, int n2, int n3, int k){
+// #ifdef __clang__
+// 	using custom_cast = double (*)[mm2][mm1];
+// 	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
+// 	using custom_cast2 = double (*)[n2][n1];
+// 	custom_cast2 u = reinterpret_cast<custom_cast2>(pointer_u);
+// #else
+// 	double (*z)[mm2][mm1] = (double (*)[mm2][mm1])pointer_z;
+// 	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
+// #endif
 
 	int i3, i2, i1, d1, d2, d3, t1, t2, t3;
 
@@ -709,38 +1061,120 @@ static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, 
 	if(n1 != 3 && n2 != 3 && n3 != 3){
 		#pragma omp for
 		for(i3 = 0; i3 < mm3-1; i3++){
-			for(i2 = 0; i2 < mm2-1; i2++){
+			int tid = 0; 
+			int num_element = min(2 * mm2 * mm1 + 2 * n1 * n2, static_cast<int>(block_size / sizeof(double)));
+				for (int i = 0; i < 1; i++) {
+					myread(res, z + (i3 * mm2 * mm1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * 2 * mm2 * mm1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					myread(res, u + (2 * i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1, sizeof(double) * 2 * n2 * n1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+				for(i2 = 0; i2 < mm2-1; i2++){
+
 				for(i1 = 0; i1 < mm1; i1++){
-					z1[i1] = z[i3][i2+1][i1] + z[i3][i2][i1];
-					z2[i1] = z[i3+1][i2][i1] + z[i3][i2][i1];
-					z3[i1] = z[i3+1][i2+1][i1] + z[i3+1][i2][i1] + z1[i1];
+					z1[i1] = res->buf[tid * block_size / sizeof(double) + (i2 + 1) * mm1 + i1] + res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1];
+					z2[i1] = res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + i2 * mm1 + i1] + res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1];
+					z3[i1] = res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 + 1) * mm1 + i1] + res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + i2 * mm1 + i1] + z1[i1];
+					// z1[i1] = z[i3][i2+1][i1] + z[i3][i2][i1];
+					// z2[i1] = z[i3+1][i2][i1] + z[i3][i2][i1];
+					// z3[i1] = z[i3+1][i2+1][i1] + z[i3+1][i2][i1] + z1[i1];
+					//printf("%f %f %f \n",z1[i1], z2[i1], z3[i1]);
 				}
 				for(i1 = 0; i1 < mm1-1; i1++){
-					u[2*i3][2*i2][2*i1] = u[2*i3][2*i2][2*i1]
-						+z[i3][i2][i1];
-					u[2*i3][2*i2][2*i1+1] = u[2*i3][2*i2][2*i1+1]
-						+0.5*(z[i3][i2][i1+1]+z[i3][i2][i1]);
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + 2 * i2 * n1 + 2 * i1] += res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1];
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + 2 * i2 * n1 + 2 * i1 + 1] +=  0.5 * (res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1 + 1] + res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1]);
+					mywrite(res, u + (2 * i3 * n2 * n1 + 2 * i2 * n1 +2 * i1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1 + 2 * i2 * n1 + 2 * i1, sizeof(double) * 2);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					// u[2*i3][2*i2][2*i1] = u[2*i3][2*i2][2*i1] + z[i3][i2][i1];
+					// u[2*i3][2*i2][2*i1+1] = u[2*i3][2*i2][2*i1+1] + 0.5 * (z[i3][i2][i1+1]+z[i3][i2][i1]);
+				}
+				
+				for(i1 = 0; i1 < mm1-1; i1++){
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + (2 * i2 + 1) * n1 + 2 * i1] += 0.5 * z1[i1];
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + (2 * i2 + 1) * n1 + 2 * i1 + 1] += 0.25 * (z1[i1] + z1[i1 + 1]);
+					mywrite(res, u + (2 * i3 * n2 * n1 + (2 * i2 + 1) * n1 + 2 * i1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1 + (2 * i2 + 1) * n1 + 2 * i1, sizeof(double) * 2);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					// u[2*i3][2*i2+1][2*i1] = u[2*i3][2*i2+1][2*i1] + 0.5 * z1[i1];
+					// u[2*i3][2*i2+1][2*i1+1] = u[2*i3][2*i2+1][2*i1+1] + 0.25 * ( z1[i1] + z1[i1+1] );
+					
+				}
+
+				for(i1 = 0; i1 < mm1-1; i1++){
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + 2 * i2 * n1 + 2 * i1] += 0.5 * z2[i1];
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + 2 * i2 * n1 + 2 * i1 + 1] += 0.25 * (z2[i1] + z2[i1 + 1]);
+					mywrite(res, u + ((2 * i3 + 1) * n2 * n1 + (2 * i2) * n1 + 2 * i1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + 2 * i2 * n1 + 2 * i1, sizeof(double) * 2);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					// u[2*i3+1][2*i2][2*i1] = u[2*i3+1][2*i2][2*i1] + 0.5 * z2[i1];
+					// u[2*i3+1][2*i2][2*i1+1] = u[2*i3+1][2*i2][2*i1+1]+ 0.25*( z2[i1] + z2[i1+1] );
+					
 				}
 				for(i1 = 0; i1 < mm1-1; i1++){
-					u[2*i3][2*i2+1][2*i1] = u[2*i3][2*i2+1][2*i1]
-						+0.5 * z1[i1];
-					u[2*i3][2*i2+1][2*i1+1] = u[2*i3][2*i2+1][2*i1+1]
-						+0.25*( z1[i1] + z1[i1+1] );
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + (2 * i2 + 1) * n1 + 2 * i1] += 0.25 * z3[i1];
+					res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + (2 * i2 + 1) * n1 + 2 * i1 + 1] += 0.125 * (z3[i1] + z3[i1 + 1]);
+					mywrite(res, u + ((2 * i3 + 1) * n2 * n1 + (2 * i2 + 1) * n1 + 2 * i1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + (2 * i2 + 1) * n1 + 2 * i1, sizeof(double) * 2);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					// u[2*i3+1][2*i2+1][2*i1] = u[2*i3+1][2*i2+1][2*i1] + 0.25* z3[i1];
+					// u[2*i3+1][2*i2+1][2*i1+1] = u[2*i3+1][2*i2+1][2*i1+1] + 0.125*( z3[i1] + z3[i1+1] );
+					//printf("%f %f\n", res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + (2 * i2 + 1) * n1 + 2 * i1], res->buf[tid * block_size / sizeof(double) + 2 * mm2 * mm1 + n1 * n2 + (2 * i2 + 1) * n1 + 2 * i1 + 1]);
 				}
-				for(i1 = 0; i1 < mm1-1; i1++){
-					u[2*i3+1][2*i2][2*i1] = u[2*i3+1][2*i2][2*i1]
-						+0.5 * z2[i1];
-					u[2*i3+1][2*i2][2*i1+1] = u[2*i3+1][2*i2][2*i1+1]
-						+0.25*( z2[i1] + z2[i1+1] );
-				}
-				for(i1 = 0; i1 < mm1-1; i1++){
-					u[2*i3+1][2*i2+1][2*i1] = u[2*i3+1][2*i2+1][2*i1]
-						+0.25* z3[i1];
-					u[2*i3+1][2*i2+1][2*i1+1] = u[2*i3+1][2*i2+1][2*i1+1]
-						+0.125*( z3[i1] + z3[i1+1] );
-				}
-			}
+			}	
+			
+			// mywrite(res, z + (i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * 2 * mm2 * mm1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+			// mywrite(res, u + (2 * i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1, sizeof(double) * 2 * n2 * n1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
 		}
+	 
+			// for(i2 = 0; i2 < mm2-1; i2++){
+
+			// 	for(i1 = 0; i1 < mm1; i1++){
+			// 		z1[i1] = res.buf[]
+			// 		// z1[i1] = z[i3][i2+1][i1] + z[i3][i2][i1];
+			// 		// z2[i1] = z[i3+1][i2][i1] + z[i3][i2][i1];
+			// 		// z3[i1] = z[i3+1][i2+1][i1] + z[i3+1][i2][i1] + z1[i1];
+			// 	}
+			// 	for(i1 = 0; i1 < mm1-1; i1++){
+			// 		u[2*i3][2*i2][2*i1] = u[2*i3][2*i2][2*i1]
+			// 			+z[i3][i2][i1];
+			// 		u[2*i3][2*i2][2*i1+1] = u[2*i3][2*i2][2*i1+1]
+			// 			+0.5*(z[i3][i2][i1+1]+z[i3][i2][i1]);
+			// 	}
+			// 	for(i1 = 0; i1 < mm1-1; i1++){
+			// 		u[2*i3][2*i2+1][2*i1] = u[2*i3][2*i2+1][2*i1]
+			// 			+0.5 * z1[i1];
+			// 		u[2*i3][2*i2+1][2*i1+1] = u[2*i3][2*i2+1][2*i1+1]
+			// 			+0.25*( z1[i1] + z1[i1+1] );
+			// 	}
+			// 	for(i1 = 0; i1 < mm1-1; i1++){
+			// 		u[2*i3+1][2*i2][2*i1] = u[2*i3+1][2*i2][2*i1]
+			// 			+0.5 * z2[i1];
+			// 		u[2*i3+1][2*i2][2*i1+1] = u[2*i3+1][2*i2][2*i1+1]
+			// 			+0.25*( z2[i1] + z2[i1+1] );
+			// 	}
+			// 	for(i1 = 0; i1 < mm1-1; i1++){
+			// 		u[2*i3+1][2*i2+1][2*i1] = u[2*i3+1][2*i2+1][2*i1]
+			// 			+0.25* z3[i1];
+			// 		u[2*i3+1][2*i2+1][2*i1+1] = u[2*i3+1][2*i2+1][2*i1+1]
+			// 			+0.125*( z3[i1] + z3[i1+1] );
+			// 	}
+			// }
+		}
+
 	}else{
 		if(n1 == 3){
 			d1 = 2;
@@ -765,63 +1199,166 @@ static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, 
 		}
 		#pragma omp for
 		for(i3 = d3; i3 <= mm3-1; i3++){
-			for(i2 = d2; i2 <= mm2-1; i2++){
-				for(i1 = d1; i1 <= mm1-1; i1++){
-					u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1] =
-						u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1]
-						+z[i3-1][i2-1][i1-1];
+			int tid = 0; 
+			int num_element = min(2 * n2 * n1, static_cast<int>(block_size / sizeof(double)));
+				for (int i = 0; i < 0 + 1; i++) {
+					myread(res, z + ((i3 - 1) * mm2 * mm1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * mm2 * mm1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+
+					myread(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1, sizeof(double) *  n2 * n1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					for(i2 = d2; i2 <= mm2-1; i2++){
+						for(i1 = d1; i1 <= mm1-1; i1++){
+							res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - d2 -1) * n1 + 2 * i1 - d1 - 1] += res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1 -1];
+							mywrite(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - d1 - 1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - d2 -1) * n1 + 2 * i1 - d1 - 1, sizeof(double));
+							if (poll_completion(res)) {
+								fprintf(stderr, "poll completion failed\n");
+							}
+							//u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1] = u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1] + z[i3-1][i2-1][i1-1];
+						}
+						for(i1 = 1; i1 <= mm1-1; i1++){
+							res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - d2 -1) * n1 + 2 * i1 - t1 - 1] += 0.5 * (res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1] 
+																																		+ res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1 -1] );
+							mywrite(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - t1 - 1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - d2 -1) * n1 + 2 * i1 - t1 - 1, sizeof(double));
+							if (poll_completion(res)) {
+								fprintf(stderr, "poll completion failed\n");
+							}
+							//u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1] = u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1] + 0.5*(z[i3-1][i2-1][i1]+z[i3-1][i2-1][i1-1]);
+						}
+					}
+					for(i2 = 1; i2 <= mm2-1; i2++){
+						for (i1 = d1; i1 <= mm1-1; i1++) {
+							res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - d1 - 1] += 0.5 * (res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1 -1 ] 
+																																+ res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1 - 1]);
+							mywrite(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - d1 - 1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - d1 - 1, sizeof(double));
+							if (poll_completion(res)) {
+								fprintf(stderr, "poll completion failed\n");
+							}
+							//u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1] = u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1] + 0.5*(z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+						}
+						for(i1 = 1; i1 <= mm1-1; i1++){
+							res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - t1 - 1] += 0.25 * (res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1] +
+																																res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1] +
+																																res->buf[tid * block_size / sizeof(double) + i2 * mm1 + i1 - 1] + 
+																																res->buf[tid * block_size / sizeof(double) + (i2 - 1) * mm1 + i1 -1]);
+							mywrite(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - t1 - 1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1 + (2 * i2 - t2 - 1) * n1 + 2 * i1 - t1 - 1, sizeof(double));
+							if (poll_completion(res)) {
+								fprintf(stderr, "poll completion failed\n");
+							}
+							//u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1] = u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1] + 0.25*(z[i3-1][i2][i1]+z[i3-1][i2-1][i1] + z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+						}
+					}
+					// mywrite(res, z + ((i3 - 1) * mm2 * mm1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * mm2 * mm1);
+					// if (poll_completion(res)) {
+					// 	fprintf(stderr, "poll completion failed\n");
+					// }
+					// mywrite(res, u + ((2 * i3 - d3 - 1) * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + mm2 * mm1, sizeof(double) * n2 * n1);
+					// if (poll_completion(res)) {
+					// 	fprintf(stderr, "poll completion failed\n");
+					// }
 				}
-				for(i1 = 1; i1 <= mm1-1; i1++){
-					u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1] =
-						u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1]
-						+0.5*(z[i3-1][i2-1][i1]+z[i3-1][i2-1][i1-1]);
-				}
-			}
-			for(i2 = 1; i2 <= mm2-1; i2++){
-				for ( i1 = d1; i1 <= mm1-1; i1++) {
-					u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1] =
-						u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1]
-						+0.5*(z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
-				}
-				for(i1 = 1; i1 <= mm1-1; i1++){
-					u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1] =
-						u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1]
-						+0.25*(z[i3-1][i2][i1]+z[i3-1][i2-1][i1]
-								+z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
-				}
-			}
+			
+			// for(i2 = d2; i2 <= mm2-1; i2++){
+			// 	for(i1 = d1; i1 <= mm1-1; i1++){
+			// 		u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1] = u[2*i3-d3-1][2*i2-d2-1][2*i1-d1-1] + z[i3-1][i2-1][i1-1];
+			// 	}
+			// 	for(i1 = 1; i1 <= mm1-1; i1++){
+			// 		u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1] = u[2*i3-d3-1][2*i2-d2-1][2*i1-t1-1] + 0.5*(z[i3-1][i2-1][i1]+z[i3-1][i2-1][i1-1]);
+			// 	}
+			// }
+			// for(i2 = 1; i2 <= mm2-1; i2++){
+			// 	for ( i1 = d1; i1 <= mm1-1; i1++) {
+			// 		u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1] = u[2*i3-d3-1][2*i2-t2-1][2*i1-d1-1] + 0.5*(z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+			// 	}
+			// 	for(i1 = 1; i1 <= mm1-1; i1++){
+			// 		u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1] = u[2*i3-d3-1][2*i2-t2-1][2*i1-t1-1] + 0.25*(z[i3-1][i2][i1]+z[i3-1][i2-1][i1] + z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+			// 	}
+			// }
 		}
 		#pragma omp for
 		for(i3 = 1; i3 <= mm3-1; i3++){
+			int tid = 0; 
+			int num_element = min(n2 * n1, static_cast<int>(block_size / sizeof(double)));
+				for (int i = 0; i < 0 + 1; i++) {
+					myread(res, z + ((i3 - 1) * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * 2 * mm2 * mm1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+					myread(res, u + ((2 * i3 - t3 - 1) * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1, sizeof(double) * n2 * n1);
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 			for(i2 = d2; i2 <= mm2-1; i2++){
 				for(i1 = d1; i1 <= mm1-1; i1++){
-					u[2*i3-t3-1][2*i2-d2-1][2*i1-d1-1] =
-						u[2*i3-t3-1][2*i2-d2-1][2*i1-d1-1]
-						+0.5*(z[i3][i2-1][i1-1]+z[i3-1][i2-1][i1-1]);
+					res->buf[tid * block_size / sizeof(double) +  2 * mm2 * mm1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - d1 - 1] += 0.5 * (res->buf[tid * block_size / sizeof(double) + n2 * n1 + (i2 - 1) * n1 + i1 -1] 
+																													+ res->buf[tid * block_size  / sizeof(double) + (i2 - 1) * n1 + i1 -1]);
+					//u[2*i3-t3-1][2*i2-d2-1][2*i1-d1-1] = u[2*i3-t3-1][2*i2-d2-1][2*i1-d1-1] +0.5*(z[i3][i2-1][i1-1]+z[i3-1][i2-1][i1-1]);
+					mywrite(res, u + ((2 * i3 - t3 - 1) *  n2 * n1 + (2 * i2 -d2 -1) * n1 + 2*i1-d1-1) * sizeof(double), res->buf + tid * block_size / sizeof(double) +  2 * mm2 * mm1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - d1 - 1, sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 				}
 				for(i1 = 1; i1 <= mm1-1; i1++){
-					u[2*i3-t3-1][2*i2-d2-1][2*i1-t1-1] =
-						u[2*i3-t3-1][2*i2-d2-1][2*i1-t1-1]
-						+0.25*(z[i3][i2-1][i1]+z[i3][i2-1][i1-1]
-								+z[i3-1][i2-1][i1]+z[i3-1][i2-1][i1-1]);
+					res->buf[tid * block_size / sizeof(double) +  2 * mm2 * mm1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - t1 - 1] += 0.25 * (res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 - 1) * n1 + i1] + 
+																															res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 - 1) * n1 + i1 -1]+
+																															res->buf[tid * block_size  / sizeof(double)+ (i2 - 1) * n1 + i1] + 
+																															res->buf[tid * block_size  / sizeof(double)+ (i2 - 1) * n1 + i1 -1]);
+					// u[2*i3-t3-1][2*i2-d2-1][2*i1-t1-1] = u[2*i3-t3-1][2*i2-d2-1][2*i1-t1-1]
+					// +0.25*(z[i3][i2-1][i1]+z[i3][i2-1][i1-1]
+					// +z[i3-1][i2-1][i1]+z[i3-1][i2-1][i1-1]);
+					mywrite(res, u + ((2 * i3 - t3 - 1) *  n2 * n1 + (2 * i2 -d2 -1) * n1 + 2*i1-t1-1) * sizeof(double), res->buf + tid * block_size / sizeof(double) +  2 * mm2 * mm1 + (2 * i2 - d2 - 1) * n1 + 2 * i1 - t1 - 1, sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 				}
 			}
 			for(i2 = 1; i2 <= mm2-1; i2++){
 				for (i1 = d1; i1 <= mm1-1; i1++){
-					u[2*i3-t3-1][2*i2-t2-1][2*i1-d1-1] =
-						u[2*i3-t3-1][2*i2-t2-1][2*i1-d1-1]
-						+0.25*(z[i3][i2][i1-1]+z[i3][i2-1][i1-1]
-								+z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+					res->buf[tid * block_size / sizeof(double) +  2 * n2 * n1 + (2*i2-t2-1) * n1 + 2*i1-d1-1] += 0.25 * (res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + i2 * n1 + i1 - 1] + 
+																															res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 - 1) * n1 + i1 -1]+
+																															res->buf[tid * block_size  / sizeof(double)+ i2 * n1 + i1 -1 ] + 
+																															res->buf[tid * block_size  / sizeof(double)+ (i2 - 1) * n1 + i1 -1]);
+					// u[2*i3-t3-1][2*i2-t2-1][2*i1-d1-1] = u[2*i3-t3-1][2*i2-t2-1][2*i1-d1-1]+
+					// 0.25*(z[i3][i2][i1-1]+z[i3][i2-1][i1-1]
+					// +z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+					mywrite(res, u + ((2 * i3 - t3 - 1) *  n2 * n1 + (2 * i2 -t2 -1) * n1 + 2*i1-d1-1) * sizeof(double), res->buf + tid * block_size / sizeof(double) +  2 * n2 * n1 + (2*i2-t2-1) * n1 + 2*i1-d1-1, sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 				}
 				for(i1 = 1; i1 <= mm1-1; i1++){
-					u[2*i3-t3-1][2*i2-t2-1][2*i1-t1-1] =
-						u[2*i3-t3-1][2*i2-t2-1][2*i1-t1-1]
-						+0.125*(z[i3][i2][i1]+z[i3][i2-1][i1]
-								+z[i3][i2][i1-1]+z[i3][i2-1][i1-1]
-								+z[i3-1][i2][i1]+z[i3-1][i2-1][i1]
-								+z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+					res->buf[tid * block_size / sizeof(double) +  2 * n2 * n1 + (2*i2-t2-1) * n1 + 2*i1-t1-1] += 0.125 * (res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + i2 * n1 + i1] + 
+																															res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 - 1) * n1 + i1]+
+																															res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + i2 * n1 + i1 - 1]+
+																															res->buf[tid * block_size / sizeof(double) + mm2 * mm1 + (i2 - 1) * n1 + i1 - 1]+
+																															res->buf[tid * block_size  / sizeof(double)+ i2 * n1 + i1] + 
+																															res->buf[tid * block_size  / sizeof(double)+ (i2 - 1) * n1 + i1] +
+																															res->buf[tid * block_size  / sizeof(double)+ i2 * n1 + i1 -1] + 
+																															res->buf[tid * block_size  / sizeof(double)+ (i2 - 1) * n1 + i1 - 1]);
+																															
+					// u[2*i3-t3-1][2*i2-t2-1][2*i1-t1-1] = u[2*i3-t3-1][2*i2-t2-1][2*i1-t1-1] 
+					// +0.125*(z[i3][i2][i1]+z[i3][i2-1][i1]
+					// +z[i3][i2][i1-1]+z[i3][i2-1][i1-1]
+					// +z[i3-1][i2][i1]+z[i3-1][i2-1][i1]
+					// +z[i3-1][i2][i1-1]+z[i3-1][i2-1][i1-1]);
+					mywrite(res, u + ((2 * i3 - t3 - 1) *  n2 * n1 + (2 * i2 -t2 -1) * n1 + 2*i1-t1-1) * sizeof(double), res->buf + tid * block_size / sizeof(double) +  2 * n2 * n1 + (2*i2-t2-1) * n1 + 2*i1-t1-1, sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 				}
 			}
+			// mywrite(res, z + ((i3 - 1) * n2 * n1 + i * n2 * n1) * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * 2 * mm2 * mm1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+			// mywrite(res, u + ((2 * i3 - t3 - 1) *  n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 2 * mm2 * mm1, sizeof(double) * n2 * n1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
 		}
 	}
 	if(timeron){
@@ -831,14 +1368,15 @@ static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, 
 	#pragma omp single
     {
 		if(debug_vec[0] >= 1){
-			rep_nrm(z,mm1,mm2,mm3,(char*)"z: inter",k-1);
-			rep_nrm(u,n1,n2,n3,(char*)"u: inter",k);
+			rep_nrm(res,z,mm1,mm2,mm3,(char*)"z: inter",k-1);
+			rep_nrm(res,u,n1,n2,n3,(char*)"u: inter",k);
 		}
 		if(debug_vec[5] >= k){
-			showall(z,mm1,mm2,mm3);
-			showall(u,n1,n2,n3);
+			showall(res,z,mm1,mm2,mm3);
+			showall(res,u,n1,n2,n3);
 		}
 	}
+}
 }
 
 /* 
@@ -846,7 +1384,7 @@ static void interp(void* pointer_z, int mm1, int mm2, int mm3, void* pointer_u, 
  * multigrid v-cycle routine
  * --------------------------------------------------------------------
  */
-static void mg3P(double u[], double v[], double r[], double a[4], double c[4], int n1, int n2, int n3, int k){
+static void mg3P(struct resources *res, uint64_t u, uint64_t v, uint64_t r, double a[4], double c[4], int n1, int n2, int n3, int k){
 	int j;
 
 	/*
@@ -855,48 +1393,148 @@ static void mg3P(double u[], double v[], double r[], double a[4], double c[4], i
 	 * restrict the residual from the find grid to the coarse
 	 * -------------------------------------------------------------------
 	 */
+	// myread(res, r, res->buf, sizeof(double));
+	// if (poll_completion(res)) {
+	// 	fprintf(stderr, "poll completion failed\n");
+	// }
+	// myread(res, r + 39304 * sizeof(double), res->buf + sizeof(double) * 1, sizeof(double));
+	// if (poll_completion(res)) {
+	// 	fprintf(stderr, "poll completion failed\n");
+	// }
+	// myread(res, r + 45136 * sizeof(double), res->buf + sizeof(double) * 2, sizeof(double));
+	// if (poll_completion(res)) {
+	// 	fprintf(stderr, "poll completion failed\n");
+	// }
+	// myread(res, r + 46136 * sizeof(double), res->buf + sizeof(double) * 3, sizeof(double));
+	// if (poll_completion(res)) {
+	// 	fprintf(stderr, "poll completion failed\n");
+	// }
+	// myread(res, r + 46352 * sizeof(double), res->buf + sizeof(double) * 4, sizeof(double));
+	// if (poll_completion(res)) {
+	// 	fprintf(stderr, "poll completion failed\n");
+	// }
+	// printf("%f, %f, %f, %f, %f\n", res->buf[0], res->buf[1], res->buf[2],res->buf[3], res->buf[4]);
 	for(k = lt; k >= lb+1; k--){
 		j = k-1;
-		rprj3(&r[ir[k]], m1[k], m2[k], m3[k], &r[ir[j]], m1[j], m2[j], m3[j], k);
+		rprj3(res, r + ir[k] * sizeof(double), m1[k], m2[k], m3[k], r + ir[j] * sizeof(double), m1[j], m2[j], m3[j], k);
+		// myread(res, r + ir[k] * sizeof(double), res->buf, sizeof(double));
+		// if (poll_completion(res)) {
+		// 	fprintf(stderr, "poll completion failed\n");
+		// }
+		// myread(res, r + ir[j] * sizeof(double), res->buf + sizeof(double), sizeof(double));
+		// if (poll_completion(res)) {
+		// 	fprintf(stderr, "poll completion failed\n");
+		// }
+		// printf("%f, %f\n", res->buf[0], res->buf[1]);
+		// printf("%d, %d\n", ir[k], ir[j]);
+		// printf("%d %d %d %d %d %d \n\n", m1[k], m2[k], m3[k], m1[j], m2[j], m3[j]);
+		//rprj3(res, &r[ir[k]], m1[k], m2[k], m3[k], &r[ir[j]], m1[j], m2[j], m3[j], k);
 	}
-
 	k = lb;
 	/*
 	 * --------------------------------------------------------------------
 	 * compute an approximate solution on the coarsest grid
 	 * --------------------------------------------------------------------
 	 */
-	zero3(&u[ir[k]], m1[k], m2[k], m3[k]);
-	psinv(&r[ir[k]], &u[ir[k]], m1[k], m2[k], m3[k], c, k);
+	zero3(res, u + ir[k] * sizeof(double), m1[k], m2[k], m3[k]);
+	
+	psinv(res, r + ir[k] * sizeof(double), u + ir[k] * sizeof(double), m1[k], m2[k], m3[k], c, k);
+	// zero3(res, &u[ir[k]], m1[k], m2[k], m3[k]);
+	// psinv(res, &r[ir[k]], &u[ir[k]], m1[k], m2[k], m3[k], c, k);
 
 	for(k = lb+1; k <= lt-1; k++){
 		j = k-1;
-		/*
-		 * --------------------------------------------------------------------
-		 * prolongate from level k-1  to k
-		 * -------------------------------------------------------------------
-		 */
-		zero3(&u[ir[k]], m1[k], m2[k], m3[k]);
-		interp(&u[ir[j]], m1[j], m2[j], m3[j], &u[ir[k]], m1[k], m2[k], m3[k], k);
-		/*
-		 * --------------------------------------------------------------------
-		 * compute residual for level k
-		 * --------------------------------------------------------------------
-		 */
-		resid(&u[ir[k]], &r[ir[k]], &r[ir[k]], m1[k], m2[k], m3[k], a, k);	
-		/*
-		 * --------------------------------------------------------------------
-		 * apply smoother
-		 * --------------------------------------------------------------------
-		 */
-		psinv(&r[ir[k]], &u[ir[k]], m1[k], m2[k], m3[k], c, k);
+		zero3(res, u + ir[k] * sizeof(double), m1[k], m2[k], m3[k]);
+		interp(res, u + ir[j] * sizeof(double), m1[j], m2[j], m3[j], u + ir[k] * sizeof(double), m1[k], m2[k], m3[k], k);
+		// zero3(res, &u[ir[k]], m1[k], m2[k], m3[k]);
+		// interp(res, &u[ir[j]], m1[j], m2[j], m3[j], &u[ir[k]], m1[k], m2[k], m3[k], k);
+		resid(res, u + ir[k] * sizeof(double), r + ir[k] * sizeof(double), r + ir[k] * sizeof(double), m1[k], m2[k], m3[k], a, k);	
+		// resid(res, &u[ir[k]], &r[ir[k]], &r[ir[k]], m1[k], m2[k], m3[k], a, k);	
+		psinv(res, r + ir[k] * sizeof(double), u + ir[k] * sizeof(double), m1[k], m2[k], m3[k], c, k);
+		//printf("k = %d\n", k);
+		// psinv(res, &r[ir[k]], &u[ir[k]], m1[k], m2[k], m3[k], c, k);
 	}
-
+	
 	j = lt - 1;
 	k = lt;
-	interp(&u[ir[j]], m1[j], m2[j], m3[j], u, n1, n2, n3, k);	
-	resid(u, v, r, n1, n2, n3, a, k);	
-	psinv(r, u, n1, n2, n3, c, k);
+	//interp(res, &u[ir[j]], m1[j], m2[j], m3[j], u, n1, n2, n3, k);	
+	interp(res, u + ir[j] * sizeof(double), m1[j], m2[j], m3[j], u, n1, n2, n3, k);	
+	resid(res, u, v, r, n1, n2, n3, a, k);	
+	psinv(res, r, u, n1, n2, n3, c, k);
+	// FILE *file_v, *file_r, *file_u;
+    // file_v = fopen("v.txt", "w"); 
+	// file_r = fopen("r.txt", "w");
+	// file_u = fopen("u.txt", "w");
+
+    // if (file_v == NULL) {
+    //     perror("Error opening file");
+    // }
+	// if (file_u == NULL) {
+    //     perror("Error opening file");
+    // }
+	// if (file_r == NULL) {
+    //     perror("Error opening file");
+    // }
+	
+	// int cnt = ceil(NR * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(res, u + i * cpupool_mem_size, res->buf, NR * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(res, u + i * cpupool_mem_size, res->buf, cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NR * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_u, "%f \n", res->buf[j]);
+	// 	}
+	// }
+	
+	
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(res, r + i * cpupool_mem_size, res->buf, NR * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(res, r + i * cpupool_mem_size, res->buf, cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NR * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_r, "%f \n", res->buf[j]);
+	// 	}
+	// }
+
+	// cnt = ceil(NV * sizeof(double) / cpupool_mem_size) + 1;
+	// for (int i = 0; i < cnt; i++) {
+	// 	if (i == cnt - 1) {
+	// 		myread(res, v + i * cpupool_mem_size, res->buf, NV * sizeof(double) - i * cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	} else {
+	// 		myread(res, v + i * cpupool_mem_size, res->buf, cpupool_mem_size);
+	// 		if (poll_completion(res)) {
+	// 			fprintf(stderr, "poll completion failed\n");
+	// 		}
+	// 	}
+	// 	for (int j = 0; j < min(NV * sizeof(double) - i * cpupool_mem_size, cpupool_mem_size) / sizeof(double); j++) {
+	// 		fprintf(file_v, "%f \n", res->buf[j]);
+	// 	}
+	// }
+	// fclose(file_u);
+	// fclose(file_v);
+	// fclose(file_r);
+	// exit(0);
+
+
 }
 
 /*
@@ -908,13 +1546,13 @@ static void mg3P(double u[], double v[], double r[], double a[4], double c[4], i
  * and eighth weight at the corners) for inhomogeneous boundaries.
  * ---------------------------------------------------------------------
  */
-static void norm2u3(void* pointer_r, int n1, int n2, int n3, double* rnm2, double* rnmu, int nx, int ny, int nz){
-#ifdef __clang__
-		using custom_cast = double (*)[n2][n1];
-		custom_cast r = reinterpret_cast<custom_cast>(pointer_r);
-#else
-		double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;
-#endif	
+static void norm2u3(struct resources *res, uint64_t r, int n1, int n2, int n3, double* rnm2, double* rnmu, int nx, int ny, int nz){
+// #ifdef __clang__
+// 		using custom_cast = double (*)[n2][n1];
+// 		custom_cast r = reinterpret_cast<custom_cast>(pointer_r);
+// #else
+// 		double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;
+// #endif	
 
 	static double s, rnmu_local;
 	double a;
@@ -936,15 +1574,33 @@ static void norm2u3(void* pointer_r, int n1, int n2, int n3, double* rnm2, doubl
 
 	#pragma omp for reduction(+:s,rnmu_local) 
 	for(i3 = 1; i3 < n3-1; i3++){
-		for(i2 = 1; i2 < n2-1; i2++){
-			for(i1 = 1; i1 < n1-1; i1++){
-				s = s + r[i3][i2][i1] * r[i3][i2][i1];
-				a = fabs(r[i3][i2][i1]);
-				if(a > rnmu_local){rnmu_local = a;}
+		int tid = omp_get_thread_num(); 
+		int num_element = min(n2 * n1, static_cast<int>(block_size / sizeof(double)));
+		for (int i = 0; i < ceil(n2 * n1 / num_element); i++) {
+			myread(res, r + (i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double),  sizeof(double) * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
+			}
+			for(i2 = 1; i2 < n2-1; i2++){
+				for(i1 = 1; i1 < n1-1; i1++){
+					s += res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1] * res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1];
+					a = fabs(res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1]);
+					// s = s + r[i3][i2][i1] * r[i3][i2][i1];
+					// a = fabs(r[i3][i2][i1]);
+					if(a > rnmu_local) {
+						rnmu_local = a;
+					}
+				}
 			}
 		}
+		// for(i2 = 1; i2 < n2-1; i2++){
+		// 	for(i1 = 1; i1 < n1-1; i1++){
+		// 		s = s + r[i3][i2][i1] * r[i3][i2][i1];
+		// 		a = fabs(r[i3][i2][i1]);
+		// 		if(a > rnmu_local){rnmu_local = a;}
+		// 	}
+		// }
 	}
-
 	*rnmu = rnmu_local;
 	*rnm2 = sqrt(s/dn);
 	if(timeron){
@@ -991,17 +1647,16 @@ static double power(double a, int n){
  * based machines.  
  * --------------------------------------------------------------------
  */
-static void psinv(void* pointer_r, void* pointer_u, int n1, int n2, int n3, double c[4], int k){
-#ifdef __clang__
-	using custom_cast = double (*)[n2][n1];
-	custom_cast r = reinterpret_cast<custom_cast>(pointer_r);	
-	using custom_cast2 = double (*)[n2][n1];
-	custom_cast2 u = reinterpret_cast<custom_cast2>(pointer_u);
-#else
-	double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;
-	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;	
-#endif		
-
+static void psinv(struct resources *res, uint64_t r, uint64_t u, int n1, int n2, int n3, double c[4], int k){
+// #ifdef __clang__
+// 	using custom_cast = double (*)[n2][n1];
+// 	custom_cast r = reinterpret_cast<custom_cast>(pointer_r);	
+// 	using custom_cast2 = double (*)[n2][n1];
+// 	custom_cast2 u = reinterpret_cast<custom_cast2>(pointer_u);
+// #else
+// 	double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;
+// 	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;	
+// #endif		
 	int i3, i2, i1;
 	double r1[M], r2[M];
 
@@ -1012,19 +1667,43 @@ static void psinv(void* pointer_r, void* pointer_u, int n1, int n2, int n3, doub
 	
 	#pragma omp for
 	for(i3 = 1; i3 < n3-1; i3++){
-		for(i2 = 1; i2 < n2-1; i2++){
-			for(i1 = 0; i1 < n1; i1++){
-				r1[i1] = r[i3][i2-1][i1] + r[i3][i2+1][i1]
-					+ r[i3-1][i2][i1] + r[i3+1][i2][i1];
-				r2[i1] = r[i3-1][i2-1][i1] + r[i3-1][i2+1][i1]
-					+ r[i3+1][i2-1][i1] + r[i3+1][i2+1][i1];
+		int tid = omp_get_thread_num(); 
+		//int num_element = min(4 * n2 * n1, static_cast<int>(block_size / sizeof(double)));
+		//for (int i = 0; i < ceil(4 * n2 * n1 / num_element) + 1; i++) {
+			myread(res, r + (i3 - 1) * n2 * n1 * sizeof(double), res->buf,  sizeof(double) * 3 * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
 			}
-			for(i1 = 1; i1 < n1-1; i1++){
-				u[i3][i2][i1] = u[i3][i2][i1]
-					+ c[0] * r[i3][i2][i1]
-					+ c[1] * ( r[i3][i2][i1-1] + r[i3][i2][i1+1]
-							+ r1[i1] )
-					+ c[2] * ( r2[i1] + r1[i1-1] + r1[i1+1] );
+			myread(res, u + (i3 * n2 * n1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 3 * n2 * n1,  sizeof(double) * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
+			}
+
+			for(i2 = 1; i2 < n2-1; i2++){
+				for(i1 = 0; i1 < n1; i1++){
+					r1[i1] = res->buf[n2 * n1 + (i2 - 1) * n1 + i1] + res->buf[n2 * n1 + (i2 + 1) * n1 + i1]
+						+ res->buf[i2 * n1 + i1] + res->buf[2 * n2 * n1  + i2 * n1 + i1];
+				// r1[i1] = r[i3][i2-1][i1] + r[i3][i2+1][i1]
+				// 	+ r[i3-1][i2][i1] + r[i3+1][i2][i1];
+				// r2[i1] = r[i3-1][i2-1][i1] + r[i3-1][i2+1][i1]
+				// 	+ r[i3+1][i2-1][i1] + r[i3+1][i2+1][i1];
+					r2[i1] = res->buf[(i2 - 1) * n1 + i1] + res->buf[(i2 + 1) * n1 + i1]
+						+ res->buf[2 * n2 * n1 + (i2 - 1) * n1 + i1] + res->buf[2 * n2 * n1 + (i2 + 1) * n1 + i1];
+				}
+				for(i1 = 1; i1 < n1-1; i1++){
+				
+				// u[i3][i2][i1] = u[i3][i2][i1]
+				// 	+ c[0] * r[i3][i2][i1]
+				// 	+ c[1] * ( r[i3][i2][i1-1] + r[i3][i2][i1+1] + r1[i1] )
+				// 	+ c[2] * ( r2[i1] + r1[i1-1] + r1[i1+1] );
+					res->buf[3 * n2 * n1 + i2 * n1 + i1] += c[0] * res->buf[n2 * n1 + i2 * n1 + i1]	 	
+														  + c[1] * (res->buf[n2 * n1 + i2 * n1 + i1 - 1] + res->buf[n2 * n1 + i2 * n1 + i1 + 1] + r1[i1])
+														  + c[2] * (r2[i1] + r1[i1 - 1] + r1[i1 + 1]);
+					
+					mywrite(res, u + (i3 * n2 * n1 + i2 * n1 + i1) * sizeof(double), res->buf + 3 * n2 * n1 + i2 * n1 + i1,  sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
 				/*
 				 * --------------------------------------------------------------------
 				 * assume c(3) = 0    (enable line below if c(3) not= 0)
@@ -1032,8 +1711,17 @@ static void psinv(void* pointer_r, void* pointer_u, int n1, int n2, int n3, doub
 				 * > + c(3) * ( r2(i1-1) + r2(i1+1) )
 				 * --------------------------------------------------------------------
 				 */
+				}
 			}
-		}
+			
+			// mywrite(res, r + ((i3 - 1) * n2 * n1 + i * n2 * n1) * sizeof(double), res->buf + tid * block_size / sizeof(double),  sizeof(double) * 3 * n2 * n1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+			// mywrite(res, u + (i3 * n2 * n1 + i * n2 * n1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 3 * n2 * n1,  sizeof(double) * n2 * n1);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
 	}
 	if(timeron){
 		#pragma omp master
@@ -1045,27 +1733,27 @@ static void psinv(void* pointer_r, void* pointer_u, int n1, int n2, int n3, doub
 	 * exchange boundary points
 	 * --------------------------------------------------------------------
 	 */
-	comm3(u,n1,n2,n3,k);
+	//comm3(res, u,n1,n2,n3,k);
 
 	if(debug_vec[0] >= 1){
 		#pragma omp single
-			rep_nrm(u,n1,n2,n3,(char*)"   psinv",k);
+			rep_nrm(res, u,n1,n2,n3,(char*)"   psinv", k);
 	}
 
 	if(debug_vec[3] >= k){
 		#pragma omp single
-			showall(u,n1,n2,n3);
+			showall(res, u,n1,n2,n3);
 	}
-}
 
+}
 /*
  * ---------------------------------------------------------------------
  * report on norm
  * ---------------------------------------------------------------------
  */
-static void rep_nrm(void* pointer_u, int n1, int n2, int n3, char* title, int kk){
+static void rep_nrm(struct resources *res, uint64_t u, int n1, int n2, int n3, char* title, int kk){
 	double rnm2, rnmu;
-	norm2u3(pointer_u,n1,n2,n3,&rnm2,&rnmu,nx[kk],ny[kk],nz[kk]);
+	norm2u3(res,u,n1,n2,n3,&rnm2,&rnmu,nx[kk],ny[kk],nz[kk]);
 	#pragma omp master
 		printf(" Level%2d in %8s: norms =%21.14e%21.14e\n", kk, title, rnm2, rnmu);
 }
@@ -1084,19 +1772,19 @@ static void rep_nrm(void* pointer_u, int n1, int n2, int n3, char* title, int kk
  * based machines.  
  * --------------------------------------------------------------------
  */
-static void resid(void* pointer_u, void* pointer_v, void* pointer_r, int n1, int n2, int n3, double a[4], int k){
-#ifdef __clang__
-	using custom_cast = double (*)[n2][n1];
-	custom_cast u = reinterpret_cast<custom_cast>(pointer_u);	
-	using custom_cast2 = double (*)[n2][n1];
-	custom_cast2 v = reinterpret_cast<custom_cast2>(pointer_v);
-	using custom_cast3 = double (*)[n2][n1];
-	custom_cast3 r = reinterpret_cast<custom_cast3>(pointer_r);	
-#else
-	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
-	double (*v)[n2][n1] = (double (*)[n2][n1])pointer_v;
-	double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;		
-#endif
+static void resid(struct resources *res, uint64_t u, uint64_t v, uint64_t r, int n1, int n2, int n3, double a[4], int k) {
+// #ifdef __clang__
+// 	using custom_cast = double (*)[n2][n1];
+// 	custom_cast u = reinterpret_cast<custom_cast>(pointer_u);	
+// 	using custom_cast2 = double (*)[n2][n1];
+// 	custom_cast2 v = reinterpret_cast<custom_cast2>(pointer_v);
+// 	using custom_cast3 = double (*)[n2][n1];
+// 	custom_cast3 r = reinterpret_cast<custom_cast3>(pointer_r);	
+// #else
+// 	double (*u)[n2][n1] = (double (*)[n2][n1])pointer_u;
+// 	double (*v)[n2][n1] = (double (*)[n2][n1])pointer_v;
+// 	double (*r)[n2][n1] = (double (*)[n2][n1])pointer_r;		
+// #endif
 
 	int i3, i2, i1;
 	double u1[M], u2[M];
@@ -1107,28 +1795,77 @@ static void resid(void* pointer_u, void* pointer_v, void* pointer_r, int n1, int
 	}
 	#pragma omp for
 	for(i3 = 1; i3 < n3-1; i3++){
-		for(i2 = 1; i2 < n2-1; i2++){
-			for(i1 = 0; i1 < n1; i1++){
-				u1[i1] = u[i3][i2-1][i1] + u[i3][i2+1][i1]
-					+ u[i3-1][i2][i1] + u[i3+1][i2][i1];
-				u2[i1] = u[i3-1][i2-1][i1] + u[i3-1][i2+1][i1]
-					+ u[i3+1][i2-1][i1] + u[i3+1][i2+1][i1];
+		int tid = 0; 
+		int num_element = min(4 * n2 * n1, static_cast<int>(block_size / sizeof(double)));
+		for (int i = 0; i < 0 + 1; i++) {
+			myread(res, u + ((i3 - 1) * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size /sizeof(double),  sizeof(double) * 3 * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
 			}
+			myread(res, v + (i3 * n2 * n1 + i * num_element) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 3 * n2 * n1,  sizeof(double) * n2 * n1);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
+			}
+
+			for(i2 = 1; i2 < n2-1; i2++){
+				for(i1 = 0; i1 < n1; i1++){
+					u1[i1] = res->buf[tid * block_size / sizeof(double) + n2 * n1 + (i2 - 1) * n1 + i1] + res->buf[tid * block_size / sizeof(double) + n2 * n1 + (i2 + 1) * n1 + i1]
+							+ res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1] + res->buf[tid * block_size / sizeof(double) + 2 * n2 * n1 + i2 * n1 + i1];
+					// u1[i1] = u[i3][i2-1][i1] + u[i3][i2+1][i1]
+					// 	+ u[i3-1][i2][i1] + u[i3+1][i2][i1];
+					// u2[i1] = u[i3-1][i2-1][i1] + u[i3-1][i2+1][i1]
+					// 	+ u[i3+1][i2-1][i1] + u[i3+1][i2+1][i1];
+					u2[i1] = res->buf[tid * block_size / sizeof(double) + (i2 - 1) * n1 + i1] + res->buf[tid * block_size / sizeof(double) + (i2 + 1) * n1 + i1]
+							+ res->buf[tid * block_size  / sizeof(double) + 2 * n2 * n1 + (i2 - 1) * n1 + i1] + res->buf[tid * block_size / sizeof(double) + 2 * n2 * n1 + (i2 + 1) * n1 + i1];
+				}
+			
 			for(i1 = 1; i1 < n1-1; i1++){
-				r[i3][i2][i1] = v[i3][i2][i1]
-					- a[0] * u[i3][i2][i1]
-					/*
-					 * ---------------------------------------------------------------------
-					 * assume a(1) = 0 (enable 2 lines below if a(1) not= 0)
-					 * ---------------------------------------------------------------------
-					 * > - a(1) * ( u(i1-1,i2,i3) + u(i1+1,i2,i3)
-					 * > + u1(i1) )
-					 * ---------------------------------------------------------------------
-					 */
-					- a[2] * ( u2[i1] + u1[i1-1] + u1[i1+1] )
-					- a[3] * ( u2[i1-1] + u2[i1+1] );
+				/*reuse block*//******************************************************************************************************************************/
+				res->buf[tid * block_size / sizeof(double) + 4 * n2 * n1 + i2 * n1 + i1] = res->buf[tid * block_size / sizeof(double) + 3 * n2 * n1 + i2 * n1 + i1] 
+																						- a[0] * res->buf[tid * block_size / sizeof(double) + n2 * n1 + i2 * n1 + i1] 
+																						- a[2] * (u2[i1] + u1[i1-1] + u1[i1+1]) 
+																						- a[3] * (u2[i1-1] + u2[i1 + 1]);
+				mywrite(res, r + (i3 * n1 * n2 + i2 * n1 + i1) * sizeof(double), res->buf + tid * block_size / sizeof(double) + 4 * n2 * n1 + i2 * n1 + i1, sizeof(double));
+				if (poll_completion(res)) {
+					fprintf(stderr, "poll completion failed\n");
+				}
+				// r[i3][i2][i1] = v[i3][i2][i1]
+				// 	- a[0] * u[i3][i2][i1]
+				// 	/*
+				// 	 * ---------------------------------------------------------------------
+				// 	 * assume a(1) = 0 (enable 2 lines below if a(1) not= 0)
+				// 	 * ---------------------------------------------------------------------
+				// 	 * > - a(1) * ( u(i1-1,i2,i3) + u(i1+1,i2,i3)
+				// 	 * > + u1(i1) )
+				// 	 * ---------------------------------------------------------------------
+				// 	 */
+				// 	- a[2] * ( u2[i1] + u1[i1-1] + u1[i1+1] )
+				// 	- a[3] * ( u2[i1-1] + u2[i1 + 1]);
+				}
 			}
 		}
+		// for(i2 = 1; i2 < n2-1; i2++){
+		// 	for(i1 = 0; i1 < n1; i1++){
+		// 		u1[i1] = u[i3][i2-1][i1] + u[i3][i2+1][i1]
+		// 			+ u[i3-1][i2][i1] + u[i3+1][i2][i1];
+		// 		u2[i1] = u[i3-1][i2-1][i1] + u[i3-1][i2+1][i1]
+		// 			+ u[i3+1][i2-1][i1] + u[i3+1][i2+1][i1];
+		// 	}
+		// 	for(i1 = 1; i1 < n1-1; i1++){
+		// 		r[i3][i2][i1] = v[i3][i2][i1]
+		// 			- a[0] * u[i3][i2][i1]
+		// 			/*
+		// 			 * ---------------------------------------------------------------------
+		// 			 * assume a(1) = 0 (enable 2 lines below if a(1) not= 0)
+		// 			 * ---------------------------------------------------------------------
+		// 			 * > - a(1) * ( u(i1-1,i2,i3) + u(i1+1,i2,i3)
+		// 			 * > + u1(i1) )
+		// 			 * ---------------------------------------------------------------------
+		// 			 */
+		// 			- a[2] * ( u2[i1] + u1[i1-1] + u1[i1+1] )
+		// 			- a[3] * ( u2[i1-1] + u2[i1+1] );
+		// 	}
+		// }
 	}
 	if(timeron){
 		#pragma omp master
@@ -1140,16 +1877,16 @@ static void resid(void* pointer_u, void* pointer_v, void* pointer_r, int n1, int
 	 * exchange boundary data
 	 * --------------------------------------------------------------------
 	 */
-	comm3(r,n1,n2,n3,k);
+	//comm3(res, r, n1,n2,n3,k);
 
 	if(debug_vec[0] >= 1){
 		#pragma omp single
-			rep_nrm(r,n1,n2,n3,(char*)"   resid",k);
+			rep_nrm(res, r,n1,n2,n3,(char*)"   resid",k);
 	}
 
 	if(debug_vec[2] >= k){
 		#pragma omp single
-			showall(r,n1,n2,n3);
+			showall(res, r,n1,n2,n3);
 	}
 }
 
@@ -1164,16 +1901,16 @@ static void resid(void* pointer_u, void* pointer_v, void* pointer_r, int n1, int
  * based machines.  
  * --------------------------------------------------------------------
  */
-static void rprj3(void* pointer_r, int m1k, int m2k, int m3k, void* pointer_s, int m1j, int m2j, int m3j, int k){
-#ifdef __clang__
-	using custom_cast = double (*)[m2k][m1k];
-	custom_cast r = reinterpret_cast<custom_cast>(pointer_r);
-	using custom_cast2 = double (*)[m2j][m1j];
-	custom_cast2 s = reinterpret_cast<custom_cast2>(pointer_s);
-#else
-	double (*r)[m2k][m1k] = (double (*)[m2k][m1k])pointer_r;
-	double (*s)[m2j][m1j] = (double (*)[m2j][m1j])pointer_s;		
-#endif	
+static void rprj3(struct resources *res, uint64_t r, int m1k, int m2k, int m3k, uint64_t s, int m1j, int m2j, int m3j, int k){
+// #ifdef __clang__
+// 	using custom_cast = double (*)[m2k][m1k];
+// 	custom_cast r = reinterpret_cast<custom_cast>(pointer_r);
+// 	using custom_cast2 = double (*)[m2j][m1j];
+// 	custom_cast2 s = reinterpret_cast<custom_cast2>(pointer_s);
+// #else
+// 	double (*r)[m2k][m1k] = (double (*)[m2k][m1k])pointer_r;
+// 	double (*s)[m2j][m1j] = (double (*)[m2j][m1j])pointer_s;		
+// #endif	
 
 	int j3, j2, j1, i3, i2, i1, d1, d2, d3, j;
 
@@ -1186,7 +1923,7 @@ static void rprj3(void* pointer_r, int m1k, int m2k, int m3k, void* pointer_s, i
 	if(m1k == 3){
 		d1 = 2;
 	}else{
-		d1 = 1;
+		d1 = 1;	
 	}
 	if(m2k == 3){
 		d2 = 2;
@@ -1198,49 +1935,105 @@ static void rprj3(void* pointer_r, int m1k, int m2k, int m3k, void* pointer_s, i
 	}else{
 		d3 = 1;
 	}
-
+	
 	#pragma omp for
 	for(j3 = 1; j3 < m3j-1; j3++){
-		i3 = 2*j3-d3;		
-		for(j2 = 1; j2 < m2j-1; j2++){
-			i2 = 2*j2-d2;
-			for(j1 = 1; j1 < m1j; j1++){
-				i1 = 2*j1-d1;				
-				x1[i1] = r[i3+1][i2][i1] + r[i3+1][i2+2][i1]
-					+ r[i3][i2+1][i1] + r[i3+2][i2+1][i1];
-				y1[i1] = r[i3][i2][i1] + r[i3+2][i2][i1]
-					+ r[i3][i2+2][i1] + r[i3+2][i2+2][i1];
+		//int tid = omp_get_thread_num(); 
+		i3 = 2*j3-d3;	
+		//int num_element = min(4 * NM * NM, static_cast<int>(block_size / sizeof(double)));
+		
+		//for (int i = 0; i < ceil(NM * NM / num_element) + 1; i++) {
+			myread(res, r + (i3 * m1k * m2k) * sizeof(double), res->buf,  sizeof(double) * 3 * m1k * m2k);
+			if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
 			}
-			for(j1 = 1; j1 < m1j-1; j1++){
-				i1 = 2*j1-d1;				
-				y2 = r[i3][i2][i1+1] + r[i3+2][i2][i1+1]
-					+ r[i3][i2+2][i1+1] + r[i3+2][i2+2][i1+1];
-				x2 = r[i3+1][i2][i1+1] + r[i3+1][i2+2][i1+1]
-					+ r[i3][i2+1][i1+1] + r[i3+2][i2+1][i1+1];
-				s[j3][j2][j1] =
-					0.5 * r[i3+1][i2+1][i1+1]
-					+ 0.25 * ( r[i3+1][i2+1][i1] + r[i3+1][i2+1][i1+2] + x2)
-					+ 0.125 * ( x1[i1] + x1[i1+2] + y2)
-					+ 0.0625 * ( y1[i1] + y1[i1+2] );
-			}
-		}
-	}
+			
+			// myread(res, s + (j3 * m1j * m2j ) * sizeof(double), res->buf + 3 * m1k * m2k,  sizeof(double) * m1j * m2j);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+
+			for(j2 = 1; j2 < m2j-1; j2++){
+				i2 = 2*j2-d2;
+				for(j1 = 1; j1 < m1j; j1++){
+					i1 = 2 * j1-d1;	
+
+					x1[i1] = res->buf[m1k * m2k + i2 * m1k + i1] + res->buf[m1k * m2k + (i2 + 2) * m1k + i1]	
+							+ res->buf[(i2 + 1) * m1k + i1] + res->buf[2 * m1k * m2k + (i2 + 1) * m1k + i1];
+					y1[i1] = res->buf[i2 * m1k + i1] + res->buf[2 * m1k * m2k + i2 * m1k + i1]	
+							+ res->buf[(i2 + 2) * m1k + i1] + res->buf[2 * m1k * m2k + (i2 + 2) * m1k + i1];
+					// x1[i1] = r[i3+1][i2][i1] + r[i3+1][i2+2][i1]
+					// 	+ r[i3][i2+1][i1] + r[i3+2][i2+1][i1];
+
+					// y1[i1] = r[i3][i2][i1] + r[i3+2][i2][i1]
+					// 	+ r[i3][i2+2][i1] + r[i3+2][i2+2][i1];
+				}
+				for(j1 = 1; j1 < m1j-1; j1++){
+					i1 = 2*j1-d1;
+					y2 = res->buf[i2 * m1k + i1 + 1] + res->buf[2 * m1k * m2k + i2 * m1k + i1 + 1]
+							+ res->buf[(i2 + 2) * m1k + i1 + 1] + res->buf[2 * m1k * m2k + (i2 + 2) * m1k + i1 + 1];
+					x2 = res->buf[m1k * m2k + i2 * m1k + i1 + 1] + res->buf[m1k * m2k  + (i2 + 2) * m1k + i1 + 1]	
+							+ res->buf[(i2 + 1) * m1k + i1 + 1] + res->buf[2 * m1k * m2k + (i2 + 1) * m1k + i1 + 1];		
+								
+					// y2 = r[i3][i2][i1+1] + r[i3+2][i2][i1+1]
+					// 	+ r[i3][i2+2][i1+1] + r[i3+2][i2+2][i1+1];
+
+					// x2 = r[i3+1][i2][i1+1] + r[i3+1][i2+2][i1+1]
+					// 	+ r[i3][i2+1][i1+1] + r[i3+2][i2+1][i1+1];
+
+					res->buf[3 * m1k * m2k  + j2 * m1j + j1]
+					/*s[j3][j2][j1]*/ = 0.5 * res->buf[m1k * m2k + (i2 + 1) * m1k + i1 + 1] 
+									+ 0.25 * (res->buf[m1k * m2k  + (i2 + 1) * m1k + i1] + res->buf[m1k * m2k + (i2 + 1) * m1k + i1 + 2] + x2)
+									+ 0.125 * (x1[i1] + x1[i1 + 2] + y2)
+									+0.0625 * (y1[i1] + y1[i1+2]);
+						// 0.5 * r[i3+1][i2+1][i1+1]
+						// + 0.25 * ( r[i3+1][i2+1][i1] + r[i3+1][i2+1][i1+2] + x2)
+						// + 0.125 * ( x1[i1] + x1[i1+2] + y2)
+						// + 0.0625 * ( y1[i1] + y1[i1+2] );
+					//printf("%f \n", res->buf[3 * m1k * m2k  + j2 * m1j + j1]);
+					mywrite(res, s + (j3 * m1j * m2j + j2 * m1j + j1) * sizeof(double), res->buf + 3 * m1k * m2k + j2 * m1j + j1,  sizeof(double));
+					if (poll_completion(res)) {
+						fprintf(stderr, "poll completion failed\n");
+					}
+				}
+			}	
+			// mywrite(res, r + (i3 * m1k * m2k) * sizeof(double), res->buf,  sizeof(double) * 3 * m1k * m2k);
+			// if (poll_completion(res)) {
+			// 	fprintf(stderr, "poll completion failed\n");
+			// }
+			
+	} 
 	if(timeron){
 		#pragma omp master
 			timer_stop(T_RPRJ3);
 	}
 
 	j=k-1;
-	comm3(s,m1j,m2j,m3j,j);
 
+
+
+	//comm3(res, s, m1j, m2j, m3j,j);
+	// for (int i = 0; i < m3j; i++) {
+	// 	myread(res, s + (i * m1j * m2j ) * sizeof(double), res->buf + 3 * m1k * m2k,  sizeof(double) * m1j * m2j);
+	// 	if (poll_completion(res)) {
+	// 		fprintf(stderr, "poll completion failed\n");
+	// 	}
+	// 	for (int j = 0; j < m2j;  j++) {
+	// 		for (int k = 0; k < m1j; k++) {
+	// 			printf("%f \n", res->buf[3 * m1k * m2k + j * m1j + k]);
+	// 		}
+	// 	}
+	// }
+	// exit(0);
+	
 	if(debug_vec[0] >= 1){
 		#pragma omp single
-			rep_nrm(s,m1j,m2j,m3j,(char*)"   rprj3",k-1);	
+			rep_nrm(res,s,m1j,m2j,m3j,(char*)"   rprj3",k-1);	
 	}
 
 	if(debug_vec[4] >= k){
 		#pragma omp single
-			showall(s,m1j,m2j,m3j);
+			showall(res,s,m1j,m2j,m3j);
 	}
 }
 
@@ -1298,13 +2091,13 @@ static void setup(int* n1, int* n2, int* n3, int k){
 	}
 }
 
-static void showall(void* pointer_z, int n1, int n2, int n3){
-#ifdef __clang__
-	using custom_cast = double (*)[n2][n1];
-	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);	
-#else
-	double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;	
-#endif
+static void showall(struct resources *res, uint64_t z, int n1, int n2, int n3){
+// #ifdef __clang__
+// 	using custom_cast = double (*)[n2][n1];
+// 	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);	
+// #else
+// 	double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;	
+// #endif
 
 	int i1,i2,i3;
 	int m1, m2, m3;
@@ -1314,10 +2107,15 @@ static void showall(void* pointer_z, int n1, int n2, int n3){
 	m3 = min(n3,18);
 
 	printf("\n");
+
 	for(i3 = 0; i3 < m3; i3++){
+		mywrite(res, z + i3 * sizeof(m2 * m1) * sizeof(double), res->buf, sizeof(m2 * m1) * sizeof(double));
+		if (poll_completion(res)) {
+				fprintf(stderr, "poll completion failed\n");
+		}
 		for(i2 = 0; i2 < m2; i2++){
 			for(i1 = 0; i1 < m1; i1++){			
-				printf("%6.3f", z[i3][i2][i1]);
+				printf("%6.3f", res->buf[i2 * m1 + i1]);
 			}
 			printf("\n");
 		}
@@ -1326,23 +2124,29 @@ static void showall(void* pointer_z, int n1, int n2, int n3){
 	printf("\n");
 }
 
-static void zero3(void* pointer_z, int n1, int n2, int n3){
-#ifdef __clang__
-		using custom_cast = double (*)[n2][n1];
-		custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
-#else
-		double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;
-#endif
+static void zero3(struct resources *res, uint64_t z, int n1, int n2, int n3){
+// #ifdef __clang__
+// 		using custom_cast = double (*)[n2][n1];
+// 		custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
+// #else
+// 		double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;
+// #endif
 
 	int i1, i2, i3;
+	memset(res->buf, 0.0, n2 * n1 * sizeof(double));
 
     #pragma omp for  
-	for(i3 = 0;i3 < n3; i3++){
-		for(i2 = 0; i2 < n2; i2++){
-			for(i1 = 0; i1 < n1; i1++){
-				z[i3][i2][i1] = 0.0;
-			}
+	for(i3 = 0; i3 < n3; i3++){
+		int tid = omp_get_thread_num();
+		mywrite(res, z + i3 * n2 * n1 * sizeof(double), res->buf + tid * block_size / sizeof(double), n2 * n1 * sizeof(double));
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
 		}
+		// for(i2 = 0; i2 < n2; i2++){
+		// 	for(i1 = 0; i1 < n1; i1++){
+		// 		z[i3][i2][i1] = 0.0;
+		// 	}
+		// }
 	}
 }
 
@@ -1353,13 +2157,13 @@ static void zero3(void* pointer_z, int n1, int n2, int n3){
  * and zero elsewhere.
  * ---------------------------------------------------------------------
  */
-static void zran3(void* pointer_z, int n1, int n2, int n3, int nx, int ny, int k){
-#ifdef __clang__
-	using custom_cast = double (*)[n2][n1];
-	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
-#else
-	double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;
-#endif
+static void zran3(struct resources *res, uint64_t z, int n1, int n2, int n3, int nx, int ny, int k){
+// #ifdef __clang__
+// 	using custom_cast = double (*)[n2][n1];
+// 	custom_cast z = reinterpret_cast<custom_cast>(pointer_z);
+// #else
+// 	double (*z)[n2][n1] = (double (*)[n2][n1])pointer_z;
+// #endif
 
 	int i0, m0, m1;
 
@@ -1374,27 +2178,33 @@ static void zran3(void* pointer_z, int n1, int n2, int n3, int nx, int ny, int k
 	a2 = power(A, nx*ny);
 
 	#pragma omp parallel
-		zero3(z, n1, n2, n3);
+		zero3(res, z, n1, n2, n3);
+
+	
 
 	i = is1-2+nx*(is2-2+ny*(is3-2));
 
-	ai = power(A, i);
+	ai = power(A, i); 
 	d1 = ie1 - is1 + 1;
 	e1 = ie1 - is1 + 2;
 	e2 = ie2 - is2 + 2;
 	e3 = ie3 - is3 + 2;
 	x0 = X;
 	randlc(&x0, ai);
+	//double* ptr = (double*)(uintptr_t)z;
 	for(i3 = 1; i3 < e3; i3++){
 		x1 = x0;
 		for(i2 = 1; i2 < e2; i2++){
 			xx = x1;
-			vranlc(d1, &xx, A, &(z[i3][i2][1]));
+			vranlc(res, d1, &xx, A, z + (i3 * n2 * n1 + i2 * n1 + 1) * sizeof(double)/*&(z[i3][i2][1])*/);
 			randlc(&x1,a1);
 		}
 		randlc(&x0, a2);
 	}
 
+
+	
+	
 	/*
 	 * ---------------------------------------------------------------------
 	 * each processor looks for twenty candidates
@@ -1410,18 +2220,25 @@ static void zran3(void* pointer_z, int n1, int n2, int n3, int nx, int ny, int k
 		j2[0][i] = 0;
 		j3[0][i] = 0;
 	}
+
+	int tid = omp_get_thread_num(); 
 	for(i3 = 1; i3 < n3-1; i3++){
+		myread(res, z + i3 * n2 * n1 * sizeof(double), res->buf + tid * block_size / sizeof(double), sizeof(double) * n2 * n1);
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
 		for(i2 = 1; i2 < n2-1; i2++){
 			for(i1 = 1; i1 < n1-1; i1++){
-				if(z[i3][i2][i1] > ten[1][0]){
-					ten[1][0] = z[i3][i2][i1];
+				//printf("z: %f\n", res->buf[tid * block_size + i2 * n1 + i1]);
+				if(/*z[i3][i2][i1]*/ res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1] > ten[1][0]){
+					ten[1][0] = res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1]/*z[i3][i2][i1]*/;
 					j1[1][0] = i1;
 					j2[1][0] = i2;
 					j3[1][0] = i3;
 					bubble(ten, j1, j2, j3, MM, 1);
 				}
-				if(z[i3][i2][i1] < ten[0][0]){
-					ten[0][0] = z[i3][i2][i1];
+				if(/*z[i3][i2][i1]*/ res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1] < ten[0][0]){
+					ten[0][0] = res->buf[tid * block_size / sizeof(double) + i2 * n1 + i1]/*z[i3][i2][i1]*/;
 					j1[0][0] = i1;
 					j2[0][0] = i2;
 					j3[0][0] = i3;
@@ -1468,51 +2285,55 @@ static void zran3(void* pointer_z, int n1, int n2, int n3, int nx, int ny, int k
 	}
 	m1 = 0;
 	m0 = 0;
+	memset(res->buf, 0.0, n2 * n1 * sizeof(double));
 
 	for(i3 = 0; i3 < n3; i3++){
-		for(i2 = 0; i2 < n2; i2++){
-			for(i1 = 0; i1 < n1; i1++){
-				z[i3][i2][i1] = 0.0;
-			}
+		mywrite(res, z + i3 * n2 * n1 * sizeof(double), res->buf + tid * block_size / sizeof(double), n2 * n1 * sizeof(double));
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
+		}
+		// for(i2 = 0; i2 < n2; i2++){
+		// 	for(i1 = 0; i1 < n1; i1++){
+		// 		z[i3][i2][i1] = 0.0;
+		// 	}
+		// }
+	}
+
+	//printf("z = %ld\n", z);
+	for (i = MM-1; i >= m0; i--){
+		//z[jg[0][i][3]][jg[0][i][2]][jg[0][i][1]] = -1.0;
+		res->buf[0] = -1.0;
+		//printf("jg -1 = %d, %d, %d\n", jg[0][i][3], jg[0][i][2], jg[0][i][1]);
+		//printf("z addr is = %ld\n", z + (jg[0][i][3] * n2 * n1 + jg[0][i][2] * n1 + jg[0][i][1]) * sizeof(double));
+		//printf("jg = %d\n", jg[0][i][3] * n2 * n1 + jg[0][i][2] * n1 + jg[0][i][1]);
+		mywrite(res, z + (jg[0][i][3] * n2 * n1 + jg[0][i][2] * n1 + jg[0][i][1]) * sizeof(double), &res->buf[0], sizeof(double));
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n\n");
+		}
+	} 
+	//printf("z1 = %ld\n", z);
+
+	printf("\n\n");
+
+	for(i = MM-1; i >= m1; i--){
+		//printf("jg +1 = %d, %d, %d\n", jg[1][i][3], jg[1][i][2], jg[1][i][1]);
+		//z[jg[1][i][3]][jg[1][i][2]][jg[1][i][1]] = +1.0;
+		res->buf[tid * block_size / sizeof(double)] = +1.0;
+		mywrite(res, z + (jg[1][i][3] * n2 * n1 + jg[1][i][2] * n1 + jg[1][i][1]) * sizeof(double), res->buf + tid * block_size / sizeof(double) , sizeof(double));
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed\n");
 		}
 	}
-	for (i = MM-1; i >= m0; i--){
-		z[jg[0][i][3]][jg[0][i][2]][jg[0][i][1]] = -1.0;
-	}
-	for(i = MM-1; i >= m1; i--){
-		z[jg[1][i][3]][jg[1][i][2]][jg[1][i][1]] = +1.0;
-	}
-	#pragma omp parallel 
-	comm3(z, n1, n2, n3, k);
+
+	
+	
+
+	//#pragma omp parallel 
+	//comm3(res, z, n1, n2, n3, k);
+	
+	
 }
 
-
-/******************************************************************************
-Socket operations
-For simplicity, the example program uses TCP sockets to exchange control
-information. If a TCP/IP stack/connection is not available, connection manager
-(CM) may be used to pass this information. Use of CM is beyond the scope of
-this example
-******************************************************************************/
-/******************************************************************************
-* Function: sock_connect
-*
-* Input
-* servername URL of server to connect to (NULL for server mode)
-* port port of service
-*
-* Output
-* none
-*
-* Returns
-* socket (fd) on success, negative error code on failure
-*
-* Description
-* Connect a socket. If servername is specified a client connection will be
-* initiated to the indicated server and port. Otherwise listen on the
-* indicated port for an incoming connection.
-*
-******************************************************************************/
 static int sock_connect(const char *servername, int port)
 {
 	struct addrinfo *resolved_addr = NULL;
@@ -1546,6 +2367,8 @@ static int sock_connect(const char *servername, int port)
 				if ((tmp = connect(sockfd, iterator->ai_addr, iterator->ai_addrlen)))
 				{
 					fprintf(stdout, "failed connect \n");
+					perror("connect failed");
+					//exit(0);
 					close(sockfd);
 					sockfd = -1;
 				}
@@ -1678,16 +2501,107 @@ static int poll_completion(struct resources *res)
 		//fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
 		for (int i = 0; i < 1; i++) {
 			if (wc[i].status != IBV_WC_SUCCESS)
-		{
-			fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc[i].status, wc[i].vendor_err);
-			exit(0);
-			rc = 1;
-		}
+			{
+				printf("got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc[i].status, wc[i].vendor_err);
+				rc = 1;
+			}
 		}
 		
 	}
 	return rc;
 }
+
+static int poll_completion_2(struct resources *res)
+{
+	struct ibv_wc wc;
+	unsigned long start_time_msec;
+	unsigned long cur_time_msec;
+	struct timeval cur_time;
+	int poll_result;
+	int rc = 0;
+	/* poll the completion for a while before giving up of doing it .. */
+	gettimeofday(&cur_time, NULL);
+	start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+	do
+	{
+		poll_result = ibv_poll_cq(res->cq, 2, &wc);
+		gettimeofday(&cur_time, NULL);
+		cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+	} while ((poll_result == 0) && ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+	if (poll_result < 0)
+	{
+		/* poll CQ failed */
+		fprintf(stderr, "poll CQ failed\n");
+		rc = 1;
+	}
+	else if (poll_result == 0)
+	{ /* the CQ is empty */
+		fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
+		rc = 1;
+	}
+	else
+	{
+		/* CQE found */
+		//fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+		/* check the completion status (here we don't care about the completion opcode */
+		if (wc.status != IBV_WC_SUCCESS)
+		{
+			fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc.status, wc.vendor_err);
+			exit(0);
+			rc = 1;
+		}
+	}
+	return rc;
+}
+
+
+// static int post_malloc(struct resources *res, size_t size)
+// {
+// 	struct ibv_send_wr sr;
+// 	struct ibv_sge sge;
+// 	struct ibv_send_wr *bad_wr = NULL;
+// 	int rc;
+// 	/* prepare the scatter/gather entry */
+// 	memset(&sge, 0, sizeof(sge));
+// 	sge.addr = (uintptr_t)res->buf;
+// 	sge.length = block_size;
+// 	sge.lkey = res->mr->lkey;
+// 	/* prepare the send work request */
+// 	memset(&sr, 0, sizeof(sr));
+// 	sr.next = NULL;
+// 	sr.wr_id = 0;
+// 	sr.sg_list = &sge;
+// 	sr.num_sge = 1;
+// 	sr.opcode = IBV_WR_SEND;
+// 	sr.send_flags = IBV_SEND_SIGNALED;
+// 	if (opcode == IBV_WR_ATOMIC_CMP_AND_SWP) {
+//         // 原子比较并交换操作
+//         sr.wr.atomic.remote_addr = res->remote_props.addr;
+//         sr.wr.atomic.rkey = res->remote_props.rkey;
+//         sr.wr.atomic.compare_add = res->atomic_compare;
+//         sr.wr.atomic.swap = res->atomic_swap;
+//     } else if (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD) {
+//         // 原子取并加操作
+//         sr.wr.atomic.remote_addr = res->remote_props.addr;
+//         sr.wr.atomic.rkey = res->remote_props.rkey;
+//         sr.wr.atomic.compare_add = res->atomic_add;
+// 	} else if (opcode != IBV_WR_SEND) {
+// 		sr.wr.rdma.remote_addr = res->remote_props.addr;
+//         sr.wr.rdma.rkey = res->remote_props.rkey;
+// 	}
+
+// 	/* there is a Receive Request in the responder side, so we won't get any into RNR flow */
+// 	rc = ibv_post_send(res->qp, &sr, &bad_wr);
+// 	if (rc) {
+// 		fprintf(stderr, "failed1 to post SR\n");
+// 	}
+//     else {
+// 		printf(stdout, "Send Request was posted\n");
+// 	}
+// 		return rc;
+// 	}
+	
+
 
 
 /******************************************************************************
@@ -1809,6 +2723,106 @@ int mywrite(struct resources *res, uint64_t remote_mem_addr, double* local_buf, 
 }
 
 
+
+
+
+/******************************************************************************
+* Function: post_send
+*
+* Input
+* res pointer to resources structure
+* opcode IBV_WR_SEND, IBV_WR_RDMA_READ or IBV_WR_RDMA_WRITE
+*
+* Output
+* none
+*
+* Returns
+* 0 on success, error code on failure
+*
+* Description
+* This function will create and post a send work request
+******************************************************************************/
+// static int post_send(struct resources *res, int opcode)//, int //index)
+// {
+// 	struct ibv_send_wr sr;
+// 	struct ibv_sge sge;
+// 	struct ibv_send_wr *bad_wr = NULL;
+// 	int rc;
+
+// 	// size_t* indexes = (size_t*)malloc(block_num * sizeof(size_t));
+//     // for (size_t i = 0; i < block_num; i++) {
+//     //     indexes[i] = i;
+//     // }
+// 	// shuffle(indexes, block_num);
+
+// 	/* prepare the scatter/gather entry */
+// 	memset(&sge, 0, sizeof(sge));
+// 	//sge.addr = (uintptr_t)res->buf + block_size * index;
+// 	sge.addr = (uintptr_t)res->buf;
+// 	sge.length = block_size;
+// 	sge.lkey = res->mr->lkey;
+// 	/* prepare the send work request */
+// 	memset(&sr, 0, sizeof(sr));
+// 	sr.next = NULL;
+// 	sr.wr_id = 0;
+// 	sr.sg_list = &sge;
+// 	sr.num_sge = 1;
+// 	sr.opcode = opcode;
+// 	sr.send_flags = IBV_SEND_SIGNALED;
+// 	if (opcode == IBV_WR_ATOMIC_CMP_AND_SWP) {
+//         // 原子比较并交换操作
+//         sr.wr.atomic.remote_addr = res->remote_props.addr;
+//         sr.wr.atomic.rkey = res->remote_props.rkey;
+//         sr.wr.atomic.compare_add = res->atomic_compare;
+//         sr.wr.atomic.swap = res->atomic_swap;
+//     } else if (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD) {
+//         // 原子取并加操作
+//         sr.wr.atomic.remote_addr = res->remote_props.addr;
+//         sr.wr.atomic.rkey = res->remote_props.rkey;
+//         sr.wr.atomic.compare_add = res->atomic_add;
+// 	} else if (opcode != IBV_WR_SEND) {
+//     //     //sr.wr.rdma.remote_addr = res->remote_props.addr + block_size * index;
+// 		sr.wr.rdma.remote_addr = res->remote_props.addr;
+//         sr.wr.rdma.rkey = res->remote_props.rkey;
+// 	}
+
+//         //sr.wr.rdma.remote_addr = res->remote_props.addr + block_size * index;
+// 	// sr.wr.rdma.remote_addr = res->remote_props.addr;
+//     // sr.wr.rdma.rkey = res->remote_props.rkey;
+// 	// fprintf(stdout, "Remote Address = %ld" "\n", res->remote_props.addr);
+// 	// fprintf(stdout, "Remote Address = 0x%" PRIx64 "\n", res->remote_props.addr);
+
+
+// 	//memset(sr.wr.rdma.remote_addr, 23, block_size);
+// 	// if (opcode != IBV_WR_SEND)
+// 	// {
+// 	// 	sr.wr.rdma.remote_addr = res->remote_props.addr;
+// 	// 	sr.wr.rdma.rkey = res->remote_props.rkey;
+// 	// }
+// 	/* there is a Receive Request in the responder side, so we won't get any into RNR flow */
+// 	rc = ibv_post_send(res->qp, &sr, &bad_wr);
+// 	if (rc) {
+// 		fprintf(stderr, "failed1 to post SR\n");
+// 	}
+//     else {
+// 		switch (opcode)
+// 		{
+// 		case IBV_WR_SEND:
+// 			fprintf(stdout, "Send Request was posted\n");
+// 			break;
+// 		case IBV_WR_RDMA_READ:
+// 			//fprintf(stdout, "RDMA Read Request was posted\n");
+// 			break;
+// 		case IBV_WR_RDMA_WRITE:
+// 			//fprintf(stdout, "RDMA Write Request was posted\n");
+// 			break;
+// 		default:
+// 			//fprintf(stdout, "Unknown Request was posted\n");
+// 			break;
+// 		}
+// 	}
+// 	return rc;
+// }
 /******************************************************************************
 * Function: post_receive
 *
@@ -1895,7 +2909,7 @@ static int resources_create(struct resources *res)
 	size_t size;
 	int i;
 	int mr_flags = 0;
-	int cq_size = 500;
+	int cq_size = 1;
 	int num_devices;
 	int rc = 0;
 	/* if client side */
@@ -2042,8 +3056,8 @@ static int resources_create(struct resources *res)
 	qp_init_attr.recv_cq = res->cq;
 	qp_init_attr.cap.max_send_wr = 100;
 	qp_init_attr.cap.max_recv_wr = 100;
-	qp_init_attr.cap.max_send_sge = 10;
-	qp_init_attr.cap.max_recv_sge = 10;
+	qp_init_attr.cap.max_send_sge = 15;
+	qp_init_attr.cap.max_recv_sge = 15;
 	res->qp = ibv_create_qp(res->pd, &qp_init_attr);
 	if (!res->qp)
 	{
@@ -2387,3 +3401,84 @@ static int resources_destroy(struct resources *res)
 	return rc;
 }
 
+void vranlc(struct resources *res, int n, double *x_seed, double a, uint64_t y){
+	int i;
+	double x,t1,t2,t3,t4,a1,a2,x1,x2,z;
+	//printf("n = %d", n);
+	/*
+	 * ---------------------------------------------------------------------
+	 * break A into two parts such that A = 2^23 * A1 + A2.
+	 * ---------------------------------------------------------------------
+	 */
+	t1 = r23 * a;
+	a1 = (int)t1;
+	a2 = a - t23 * a1;
+	x = *x_seed;
+
+	/*
+	 * ---------------------------------------------------------------------
+	 * generate N results. this loop is not vectorizable.
+	 * ---------------------------------------------------------------------
+	 */
+	//printf("n = %d\n", n);
+	for(i=0; i<n; i++){
+		/*
+		 * ---------------------------------------------------------------------
+		 * break X into two parts such that X = 2^23 * X1 + X2, compute
+		 * Z = A1 * X2 + A2 * X1  (mod 2^23), and then
+		 * X = 2^23 * Z + A2 * X2  (mod 2^46).
+		 * ---------------------------------------------------------------------
+		 */
+		t1 = r23 * x;
+		x1 = (int)t1;
+		x2 = x - t23 * x1;
+		t1 = a1 * x2 + a2 * x1;
+		t2 = (int)(r23 * t1);
+		z = t1 - t23 * t2;
+		t3 = t23 * z + a2 * x2;
+		t4 = (int)(r46 * t3);
+		x = t3 - t46 * t4;
+		//y[i] = r46 * x;
+		res->buf[i] = r46 * x; 
+		//printf("res buf[i] = %f\n", res->buf[i]);
+		
+	}
+	mywrite(res, y, res->buf, sizeof(double) * n);
+	if (poll_completion(res)) {
+		fprintf(stderr, "poll completion failed\n");
+	}
+	//exit(0);
+	*x_seed = x;
+}
+
+double randlc(double *x, double a){    
+	double t1,t2,t3,t4,a1,a2,x1,x2,z;
+
+	/*
+	 * ---------------------------------------------------------------------
+	 * break A into two parts such that A = 2^23 * A1 + A2.
+	 * ---------------------------------------------------------------------
+	 */
+	t1 = r23 * a;
+	a1 = (int)t1;
+	a2 = a - t23 * a1;
+
+	/*
+	 * ---------------------------------------------------------------------
+	 * break X into two parts such that X = 2^23 * X1 + X2, compute
+	 * Z = A1 * X2 + A2 * X1  (mod 2^23), and then
+	 * X = 2^23 * Z + A2 * X2  (mod 2^46).
+	 * ---------------------------------------------------------------------
+	 */
+	t1 = r23 * (*x);
+	x1 = (int)t1;
+	x2 = (*x) - t23 * x1;
+	t1 = a1 * x2 + a2 * x1;
+	t2 = (int)(r23 * t1);
+	z = t1 - t23 * t2;
+	t3 = t23 * z + a2 * x2;
+	t4 = (int)(r46 * t3);
+	(*x) = t3 - t46 * t4;
+
+	return (r46 * (*x));
+}
