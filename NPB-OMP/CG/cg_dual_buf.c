@@ -1268,13 +1268,14 @@ static void sparse(struct resources *res, uint64_t a,
 
 				goto_40 = FALSE;
 				/**timer2************************************************************************/
-
+				
+				/*dual buf code, load the first batch data*/
 				k = rowstr[j];
 				myread(res, a + k * sizeof(double), res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 				if (poll_completion(res)) {
 					fprintf(stderr, "poll completion failed\n");
 				}
-
+				/*dual buf code, load the first data*/
 				for(k = rowstr[j]; k < rowstr[j+1]; k++){
 					if(colidx[k] > jcol){
 						/*
@@ -1282,12 +1283,9 @@ static void sparse(struct resources *res, uint64_t a,
 						 * ... insert colidx here orderly
 						 * ----------------------------------------------------------------
 						 */
-						// myread(res, a[0] + k * sizeof(double), res->buf, sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1));
-						// if (poll_completion(res)) {
-						// 	fprintf(stderr, "poll completion failed\n");
-						// }
-					
+						
 						if (sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1) <= cpupool_mem_size) {
+							/*original Code*****************/
 							// myread(res, a + k * sizeof(double), res->buf, sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1));
 							// if (poll_completion(res)) {
 							// 	fprintf(stderr, "poll completion failed\n");
@@ -1297,11 +1295,18 @@ static void sparse(struct resources *res, uint64_t a,
 							// if (poll_completion(res)) {
 							// 	fprintf(stderr, "poll completion failed\n");
 							// }
+							/*original Code*****************/
+
+							/*dual buf code, copy data from buf to buf1*/
 							memcpy(res->buf1, res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
+
+							/*load the second batch data to buf*/
 							myread(res, a + (k + 1) * sizeof(double), res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 							if (poll_completion(res)) {
 								fprintf(stderr, "poll completion failed\n");
 							}
+
+							/*write the buf1 to remote*/
 							mywrite1(res, a + (k + 1) * sizeof(double), res->buf1, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 							if (poll_completion(res)) {
 								fprintf(stderr, "poll completion failed\n");
