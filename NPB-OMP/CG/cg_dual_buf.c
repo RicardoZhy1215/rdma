@@ -91,8 +91,8 @@ struct config_t
 /* structure to exchange data which is needed to connect the QPs */
 struct cm_con_data_t 
 {
-	uint64_t addr[2];   /* Buffer address */
-	uint32_t rkey[2];   /* Remote key */
+	uint64_t addr;   /* Buffer address */
+	uint32_t rkey;   /* Remote key */
 	uint32_t qp_num; /* QP number */
 	uint16_t lid;	/* LID of the IB port */
 	uint8_t gid[16]; /* gid */
@@ -110,9 +110,8 @@ struct resources
 	struct ibv_pd *pd;				   /* PD handle */
 	struct ibv_cq *cq;				   /* CQ handle */
 	struct ibv_qp *qp;				   /* QP handle */
-	struct ibv_mr *mr[2];				   /* MR handle for buf */
-	double *buf;						   /* memory buffer pointer, used for RDMA and send ops */
-	double *buf1;
+	struct ibv_mr *mr;				   /* MR handle for buf */
+	double *buf[2];						   /* memory buffer pointer, used for RDMA and send ops */
 	int sock;						   /* TCP socket file descriptor */
 	uint64_t atomic_compare;  // CAS 操作的比较值
     uint64_t atomic_swap;     // CAS 操作的交换值
@@ -1268,14 +1267,12 @@ static void sparse(struct resources *res, uint64_t a,
 
 				goto_40 = FALSE;
 				/**timer2************************************************************************/
-				
-				/*dual buf code, load the first batch data*/
+				int index = 0;
 				k = rowstr[j];
-				myread(res, a + k * sizeof(double), res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
+				myread(res, a + k * sizeof(double), res->buf[index], sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 				if (poll_completion(res)) {
 					fprintf(stderr, "poll completion failed\n");
 				}
-				/*dual buf code, load the first data*/
 				for(k = rowstr[j]; k < rowstr[j+1]; k++){
 					if(colidx[k] > jcol){
 						/*
@@ -1283,9 +1280,12 @@ static void sparse(struct resources *res, uint64_t a,
 						 * ... insert colidx here orderly
 						 * ----------------------------------------------------------------
 						 */
-						
+						// myread(res, a[0] + k * sizeof(double), res->buf, sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1));
+						// if (poll_completion(res)) {
+						// 	fprintf(stderr, "poll completion failed\n");
+						// }
+					
 						if (sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1) <= cpupool_mem_size) {
-							/*original Code*****************/
 							// myread(res, a + k * sizeof(double), res->buf, sizeof(res->buf[0]) * ((rowstr[j+1] - 2) - k + 1));
 							// if (poll_completion(res)) {
 							// 	fprintf(stderr, "poll completion failed\n");
@@ -1295,19 +1295,13 @@ static void sparse(struct resources *res, uint64_t a,
 							// if (poll_completion(res)) {
 							// 	fprintf(stderr, "poll completion failed\n");
 							// }
-							/*original Code*****************/
-
-							/*dual buf code, copy data from buf to buf1*/
-							memcpy(res->buf1, res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
-
-							/*load the second batch data to buf*/
-							myread(res, a + (k + 1) * sizeof(double), res->buf, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
+							memcpy(res->buf[!index], res->buf[index], sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
+							
+							mywrite(res, a + (k + 1) * sizeof(double), res->buf[!index], sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 							if (poll_completion(res)) {
 								fprintf(stderr, "poll completion failed\n");
 							}
-
-							/*write the buf1 to remote*/
-							mywrite1(res, a + (k + 1) * sizeof(double), res->buf1, sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
+							myread(res, a + (k + 1) * sizeof(double), res->buf[index], sizeof(double) * ((rowstr[j+1] - 2) - k + 1));
 							if (poll_completion(res)) {
 								fprintf(stderr, "poll completion failed\n");
 							}
@@ -1838,7 +1832,7 @@ uint64_t mymalloc(struct resources *res, size_t mem_size, size_t offset) {
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)res->buf;
 	sge.length = mem_size;
-	sge.lkey = res->mr[0]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
 	sr.next = NULL;
@@ -1850,8 +1844,8 @@ uint64_t mymalloc(struct resources *res, size_t mem_size, size_t offset) {
 	memset(res->buf, 0.0, mem_size);
 	
 	//set the remote addresss
-	sr.wr.rdma.remote_addr = res->remote_props.addr[0] + offset;
-    sr.wr.rdma.rkey = res->remote_props.rkey[0];
+	sr.wr.rdma.remote_addr = res->remote_props.addr + offset;
+    sr.wr.rdma.rkey = res->remote_props.rkey;
 	//fprintf(stdout, "Remote Address = %ld" "\n", sr.wr.rdma.remote_addr);
 	//fprintf(stdout, "Remote Address = 0x%" PRIx64 "\n", sr.wr.rdma.remote_addr);
 	/* there is a Receive Request in the responder side, so we won't get any into RNR flow */
@@ -1878,7 +1872,7 @@ int myread(struct resources *res, uint64_t remote_mem_addr, double* local_buf, s
 	//sge.addr = (uintptr_t)res->buf + block_size * index;
 	sge.addr = (uintptr_t)local_buf;
 	sge.length = size;
-	sge.lkey = res->mr[0]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
 	sr.next = NULL;
@@ -1889,7 +1883,7 @@ int myread(struct resources *res, uint64_t remote_mem_addr, double* local_buf, s
 	sr.send_flags = IBV_SEND_SIGNALED;
 
 	sr.wr.rdma.remote_addr = remote_mem_addr;
-    sr.wr.rdma.rkey = res->remote_props.rkey[0];
+    sr.wr.rdma.rkey = res->remote_props.rkey;
 	//fprintf(stdout, "Remote Address that will be read = %ld" "\n", sr.wr.rdma.remote_addr);
 	//fprintf(stdout, "Remote Address that will be read = 0x%" PRIx64 "\n", sr.wr.rdma.remote_addr);
 
@@ -1918,7 +1912,7 @@ int mywrite(struct resources *res, uint64_t remote_mem_addr, double* local_buf, 
 	//sge.addr = (uintptr_t)res->buf + block_size * index;
 	sge.addr = (uintptr_t)local_buf;
 	sge.length = size;
-	sge.lkey = res->mr[0]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
 	sr.next = NULL;
@@ -1929,7 +1923,7 @@ int mywrite(struct resources *res, uint64_t remote_mem_addr, double* local_buf, 
 	sr.send_flags = IBV_SEND_SIGNALED;
 
 	sr.wr.rdma.remote_addr = remote_mem_addr;
-    sr.wr.rdma.rkey = res->remote_props.rkey[0];
+    sr.wr.rdma.rkey = res->remote_props.rkey;
 
 	rc = ibv_post_send(res->qp, &sr, &bad_wr);
 	//printf("rc = %d\n", rc);
@@ -1953,7 +1947,7 @@ int myread1(struct resources *res, uint64_t remote_mem_addr, double* local_buf, 
 	//sge.addr = (uintptr_t)res->buf + block_size * index;
 	sge.addr = (uintptr_t)local_buf;
 	sge.length = size;
-	sge.lkey = res->mr[1]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
 	sr.next = NULL;
@@ -1964,7 +1958,7 @@ int myread1(struct resources *res, uint64_t remote_mem_addr, double* local_buf, 
 	sr.send_flags = IBV_SEND_SIGNALED;
 
 	sr.wr.rdma.remote_addr = remote_mem_addr;
-    sr.wr.rdma.rkey = res->remote_props.rkey[0];
+    sr.wr.rdma.rkey = res->remote_props.rkey;
 	//fprintf(stdout, "Remote Address that will be read = %ld" "\n", sr.wr.rdma.remote_addr);
 	//fprintf(stdout, "Remote Address that will be read = 0x%" PRIx64 "\n", sr.wr.rdma.remote_addr);
 
@@ -1993,7 +1987,7 @@ int mywrite1(struct resources *res, uint64_t remote_mem_addr, double* local_buf,
 	//sge.addr = (uintptr_t)res->buf + block_size * index;
 	sge.addr = (uintptr_t)local_buf;
 	sge.length = size;
-	sge.lkey = res->mr[1]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
 	sr.next = NULL;
@@ -2004,7 +1998,7 @@ int mywrite1(struct resources *res, uint64_t remote_mem_addr, double* local_buf,
 	sr.send_flags = IBV_SEND_SIGNALED;
 
 	sr.wr.rdma.remote_addr = remote_mem_addr;
-    sr.wr.rdma.rkey = res->remote_props.rkey[0];
+    sr.wr.rdma.rkey = res->remote_props.rkey;
 
 	rc = ibv_post_send(res->qp, &sr, &bad_wr);
 	//printf("rc = %d\n", rc);
@@ -2143,7 +2137,7 @@ static int post_receive(struct resources *res)
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)res->buf;
 	sge.length = 1024;
-	sge.lkey = res->mr[0]->lkey;
+	sge.lkey = res->mr->lkey;
 	/* prepare the receive work request */
 	memset(&rr, 0, sizeof(rr));
 	rr.next = NULL;
@@ -2315,15 +2309,15 @@ static int resources_create(struct resources *res)
 
 	/* allocate the memory buffer that will hold the data */
 	size = cpupool_mem_size;
-	res->buf = (double *)malloc(size);
-	res->buf1 = (double *)malloc(size);
+	res->buf[0] = (double *)malloc(size);
+	res->buf[1] = (double *)malloc(size);
 	if (!res->buf)
 	{
 		fprintf(stderr, "failed to malloc %Zu bytes to memory buffer\n", size);
 		rc = 1;
 		goto resources_create_exit;
 	}
-	memset(res->buf, 0.0, size);
+	memset(res->buf, 0.0, 2 * size);
 	//memset(res->buf1, 0.0, size);
 	/* only in the client side put the message in the memory buffer */
 	// if (config.server_name)
@@ -2336,8 +2330,8 @@ static int resources_create(struct resources *res)
 	// /* register the memory buffer */
 	mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
 	//mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-	res->mr[0]= ibv_reg_mr(res->pd, res->buf, size, mr_flags);
-	res->mr[1] = ibv_reg_mr(res->pd, res->buf1, size, mr_flags);
+	res->mr= ibv_reg_mr(res->pd, res->buf, size * 2, mr_flags);
+	//res->mr[1] = ibv_reg_mr(res->pd, res->buf[1], size, mr_flags);
 	if (!res->mr)
 	{
 		fprintf(stderr, "ibv_reg_mr failed with mr_flags=0x%x\n", mr_flags);
@@ -2351,9 +2345,7 @@ static int resources_create(struct resources *res)
 	// 	goto resources_create_exit;
 	// }
 	fprintf(stdout, "MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x\n",
-			res->buf, res->mr[0]->lkey, res->mr[0]->rkey, mr_flags);
-	fprintf(stdout, "MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x\n",
-			res->buf1, res->mr[1]->lkey, res->mr[1]->rkey, mr_flags);
+			res->buf, res->mr->lkey, res->mr->rkey, mr_flags);
 	/* create the Queue Pair */
 	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
 	qp_init_attr.qp_type = IBV_QPT_RC;
@@ -2381,27 +2373,19 @@ resources_create_exit:
 			ibv_destroy_qp(res->qp);
 			res->qp = NULL;
 		}
-		if (res->mr[0])
+		if (res->mr)
 		{
-			ibv_dereg_mr(res->mr[0]);
-			res->mr[0] = NULL;
+			ibv_dereg_mr(res->mr);
+			res->mr = NULL;
 		}
-		if (res->mr[1])
-		{
-			ibv_dereg_mr(res->mr[1]);
-			res->mr[1] = NULL;
-		}
-
+	
 		if (res->buf)
 		{
 			free(res->buf);
-			res->buf = NULL;
+			res->buf[0] = NULL;
+			res->buf[1] = NULL;
 		}
-		if (res->buf1)
-		{
-			free(res->buf1);
-			res->buf = NULL;
-		}
+
 
 		if (res->cq)
 		{
@@ -2585,10 +2569,9 @@ static int connect_qp(struct resources *res)
 	else
 		memset(&my_gid, 0, sizeof my_gid);
 	/* exchange using TCP sockets info required to connect QPs */
-	local_con_data.addr[0] = htonll((uintptr_t)res->buf);
-	local_con_data.rkey[0] = htonl(res->mr[0]->rkey);
-	local_con_data.addr[1] = htonll((uintptr_t)res->buf1);
-	local_con_data.rkey[1] = htonl(res->mr[1]->rkey);
+	local_con_data.addr = htonll((uintptr_t)res->buf);
+	local_con_data.rkey = htonl(res->mr->rkey);
+	
 	local_con_data.qp_num = htonl(res->qp->qp_num);
 	local_con_data.lid = htons(res->port_attr.lid);
 	memcpy(local_con_data.gid, &my_gid, 16);
@@ -2599,8 +2582,8 @@ static int connect_qp(struct resources *res)
 		rc = 1;
 		goto connect_qp_exit;
 	}
-	remote_con_data.addr[0] = ntohll(tmp_con_data.addr[0]);
-	remote_con_data.rkey[0] = ntohl(tmp_con_data.rkey[0]);
+	remote_con_data.addr = ntohll(tmp_con_data.addr);
+	remote_con_data.rkey = ntohl(tmp_con_data.rkey);
 	remote_con_data.qp_num = ntohl(tmp_con_data.qp_num);
 	remote_con_data.lid = ntohs(tmp_con_data.lid);
 	memcpy(remote_con_data.gid, tmp_con_data.gid, 16);
@@ -2687,7 +2670,7 @@ static int resources_destroy(struct resources *res)
 			rc = 1;
 		}
 	if (res->mr)
-		if (ibv_dereg_mr(res->mr[0]))
+		if (ibv_dereg_mr(res->mr))
 		{
 			fprintf(stderr, "failed to deregister MR\n");
 			rc = 1;
